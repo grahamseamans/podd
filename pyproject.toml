@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "podd"
+version = "0.1.0"
+description = "A RunPod pod job runner: clients drop job directories in a queue, podd runs them on GPU or CPU pods it opens and deletes."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []          # standard library only, a hard rule (tests/test_podd.py checks every import)
+
+[project.scripts]
+podd = "podd.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+podd = ["*.sh"]

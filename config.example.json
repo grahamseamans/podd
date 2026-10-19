@@ -1,0 +1,11 @@
+{
+ "queue_directories": ["/home/you/your-project/runs/.staging"],
+ "max_pods": {"gpu": 2, "cpu": 2},
+ "idle_minutes": 3,
+ "max_price_per_hour": 0.50,
+ "cards": [{"name": "NVIDIA RTX A5000", "memory_gb": 24}, {"name": "NVIDIA A40", "memory_gb": 48}],
+ "allowed_cuda_versions": ["12.8", "12.9"],
+ "cpu_flavors": ["cpu3c", "cpu5c"],
+ "boot_seconds": 150,
+ "max_wait_for_stock_minutes": 60
+}

@@ -1,0 +1,23 @@
+# podd, the pod job runner, always on: owns the RunPod pods and runs the jobs of every queue directory its config
+# lists (~/.config/podd/config.json; README.md). A systemd USER unit; `loginctl enable-linger` keeps it up without a
+# login. It expects this repo at ~/podd (%h/podd); cloned elsewhere, change PYTHONPATH below.
+#   install: ln -sf ~/podd/systemd/podd.service ~/.config/systemd/user/ &&
+#            systemctl --user daemon-reload && systemctl --user enable --now podd
+#   logs:    journalctl --user -u podd
+#   config changed: systemctl --user restart podd (it reads the config once, at start; restart only when nothing
+#            is RUNNING: a stop pulls every running job home and requeues or fails it)
+# KillMode=process: a stop signals podd alone, which deletes its pods; pod.sh's watchdogs (children of pod.sh create)
+# and the ssh ControlMasters outlive a restart.
+[Unit]
+Description=podd: the pod job runner (RunPod GPU and CPU pods for the queue directories in ~/.config/podd/config.json)
+
+[Service]
+# a stop pulls every running job home first (daemon.py SHUTDOWN_PULL_SECONDS 840, + 60)
+TimeoutStopSec=900
+Environment=PYTHONPATH=%h/podd/src
+ExecStart=/usr/bin/python3 -u -m podd run
+Restart=on-failure
+KillMode=process
+
+[Install]
+WantedBy=default.target
