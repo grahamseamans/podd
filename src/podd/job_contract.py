@@ -20,8 +20,10 @@ THE JOB FILE:
     command      shell text run on the pod IN THE JOB'S DIRECTORY, in a session of its own; stdout and stderr go to
                  command.log, which always comes back. Exit 0 = success.
     inputs       [path in the stage]: shipped to the pod before the command (directories whole).
-    outputs      [path in the stage]: pulled back after it. What exists is pulled even when the command failed (so
-                 its logs come home); a listed output missing after exit 0 FAILS the job.
+    outputs      [path in the stage]: pulled back after it, each LAID OVER the stage's copy: a file the attempt has
+                 replaces the stage's, a file only the stage has stays (podd never deletes a file of the stage). What
+                 exists is pulled even when the command failed (so its logs come home); a listed output missing after
+                 exit 0 FAILS the job.
     requires     what the pod must be. `image`: a tag, or a list of acceptable tags (podd launches the FIRST when it
                  opens a pod for the job). Optional: `gpu` ("any" card, the default; a list of acceptable card
                  names; or "none": a CPU pod, no card at all, one of the config's cpu_flavors, sized by the job's
@@ -39,13 +41,20 @@ THE JOB FILE:
     ram_gb       optional: the RAM it uses (decimal GB; default 0).
     progress     optional: a path in the stage that the command keeps rewriting, one line `<done> <total>` (two
                  integers, units of its own: frequencies, ...). podd reads it every poll and measures the job's rate
-                 from it: a pod much slower than the fastest other pod running the same command at the same load (or,
-                 alone, than its expected_s) is SLOW (podd.daemon judge_speeds).
-    resumable    optional, true only with `progress`: run again in a directory holding the outputs an earlier attempt
-                 brought home, the command does only what is left. podd then ships the outputs present in the stage
-                 with the inputs, and REQUEUES the job (JOB again) instead of failing it when podd stops it (a slow
+                 from it: a job whose pace (seconds per unit over expected_s / total) is SLOW_FACTOR x the median pace
+                 of other pods running the same command at the same load marks its pod SLOW (podd.daemon
+                 judge_speeds; never expected_s alone).
+    resumable    optional, true only with `progress` and `resume_from`: run again, the command does only what earlier
+                 attempts did not. podd REQUEUES the job (JOB again) instead of failing it when podd stops it (a slow
                  pod, podd stopping), its pod breaks, or its deadline passes after it made progress; at most
-                 MAX_ATTEMPTS attempts (podd.daemon).
+                 MAX_ATTEMPTS attempts (podd.daemon). WHAT EARLIER ATTEMPTS BROUGHT HOME STAYS HOME (2026-10-21: the
+                 kept outputs went back up this machine's uplink, 0.2-2.2 GB a job, and timed out): the next attempt
+                 gets the inputs and the `resume_from` files only, and its outputs are laid over the stage's
+                 (`outputs`), so the command writes the units it did plus the `resume_from` files brought up to date,
+                 and never needs a finished unit's file on the pod.
+    resume_from  with `resumable` (required there, nowhere else): [path in the stage, inside one of the outputs]: the
+                 SMALL files that say what earlier attempts finished (a manifest; a log to append to), never the work
+                 itself. podd ships those present in the stage with the inputs; none present = a first attempt.
     label        optional: how podd's log names the job.
     attempts     podd's: one record per earlier attempt of a requeued job (pod, datacenter, why it stopped, progress,
                  seconds per unit); a requester never writes it.
@@ -67,7 +76,7 @@ COMMAND_LOG = "command.log"                            # the command's stdout + 
 POD_MEASURED_REQUIREMENTS = ("image", "gpu", "gpu_memory_gb_min", "cpu_min")   # podd's own; any other key is a fact
                                                                                # the image declares
 JOB_KEYS = ("command", "inputs", "outputs", "requires", "cpu", "gpu_memory_gb", "expected_s")
-OPTIONAL_JOB_KEYS = ("ram_gb", "progress", "resumable", "label", "queued_at", "attempts")
+OPTIONAL_JOB_KEYS = ("ram_gb", "progress", "resumable", "resume_from", "label", "queued_at", "attempts")
 PODD_ATTEMPTS_DIRECTORY = ".podd"                      # in the stage: each requeued attempt's command.log
                                                        # (attempt-<n>.command.log), podd's
 
@@ -200,6 +209,22 @@ def job_problems(job):
             problems.append(f"`resumable` {job['resumable']!r} must be true or false")
         elif job["resumable"] and "progress" not in job:
             problems.append("`resumable` without `progress`: podd could not tell whether an attempt got anywhere")
+        elif job["resumable"] and "resume_from" not in job:
+            problems.append("`resumable` without `resume_from`: the next attempt would not know what is done (podd "
+                            "never ships the outputs back)")
+    if "resume_from" in job:
+        if job.get("resumable") is not True:
+            problems.append("`resume_from` without `resumable` true: only a resumed attempt reads it")
+        if not (isinstance(job["resume_from"], list) and job["resume_from"]):
+            problems.append("`resume_from` must be a non-empty list of paths inside the outputs")
+        else:
+            outputs = [o for o in job.get("outputs") or [] if isinstance(o, str)]
+            for path in job["resume_from"]:
+                problem = stage_relative_path_problem(path)
+                if problem:
+                    problems.append(f"`resume_from`: {problem}")
+                elif not any(path == output or path.startswith(output.rstrip("/") + "/") for output in outputs):
+                    problems.append(f"`resume_from`: {path!r} is inside none of the outputs {outputs}")
     if "attempts" in job and not (isinstance(job["attempts"], list) and all(isinstance(a, dict)
                                                                             for a in job["attempts"])):
         problems.append("`attempts` (podd's) must be a list of records")

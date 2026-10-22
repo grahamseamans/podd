@@ -14,7 +14,8 @@ can leak a pod.
         v
   <queue directory>/<stage>/        THE CONTRACT (src/podd/job_contract.py): one directory per job, one state file
         |   JOB                     command, inputs, outputs, requires, cpu, gpu_memory_gb, expected_s (+ ram_gb,
-        |                           progress, resumable, label): the client; podd again when it requeues (+ attempts)
+        |                           progress, resumable, resume_from, label): the client; podd again when it
+        |                           requeues (+ attempts)
         |   RUNNING                 podd claimed it (rename) for one pod (that pod's facts in it)
         |   DONE | FAILED           + used (what it ran on) + timings | why, the traceback, command.log's tail
         v
@@ -83,7 +84,10 @@ THE PATTERN.
 - Work is never thrown away (2026-10-16: four jobs killed at 103-109 of 115 units, ~$5.44): every interrupted job
   (podd stopped it, its deadline, its pod broke, podd stopping) pulls home every output that exists first. Only a job
   that declares itself `resumable` is requeued -- by the daemon, the one writer of that JOB, with an `attempts` record
-  -- and its next attempt gets those outputs back and does the rest; at most MAX_ATTEMPTS.
+  -- and its next attempt does the rest; at most MAX_ATTEMPTS. What came home STAYS HOME (2026-10-21: kept outputs
+  went back up at ~1 MB/s, 0.2-2.2 GB a job, and timed out): the next attempt gets its inputs and its `resume_from`
+  files (what is done, not the work), and the merge is at home, by file: every pull lays the outputs over the
+  stage's and deletes nothing there.
 - Slow hosts are caught, not waited out: from a job's `progress` podd measures its PACE (seconds per unit over the
   job's own expected seconds per unit: one command runs jobs of many sizes) against the MEDIAN pace of at least
   MIN_REFERENCE_PODS other pods running the same command with as many jobs at once (packing is never slowness; never

@@ -67,9 +67,10 @@ pod with work on every pass). At start-up podd deletes every pod pod.sh still re
 podd that died hard left them). Stopping, podd first stops every running job and lets it pull home and requeue or
 fail (SHUTDOWN_PULL_SECONDS), then deletes its pods.
 
-ONE JOB: ship its inputs (rsync; a resumable job's outputs already in the stage too), write its command to
-<job>/.podd/command, start podd-run.sh under `nohup setsid` (the job's own session), poll <job>/.podd/exit (and its
-`progress` file, when it has one), pull its outputs and command.log, then DONE (with `used`, the pod's facts, and
+ONE JOB: ship its inputs (rsync; a resumable job's `resume_from` files too, never the rest of what came home), write
+its command to <job>/.podd/command, start podd-run.sh under `nohup setsid` (the job's own session), poll
+<job>/.podd/exit (and its `progress` file, when it has one), pull its outputs (each laid over the stage's copy: no file
+of the stage is deleted) and command.log, then DONE (with `used`, the pod's facts, and
 `timings`) or FAILED. A non-zero exit or a missing output fails the job, not the pod.
 THE DEADLINE (job_deadline_s; 2026-10-16: a fixed 6 h timeout killed four jobs on slow hosts at 103-109 of 115
 units): TIMEOUT_MARGIN x expected_s x the pod's measured slowness (at least 1) x the job's load (the most jobs its
@@ -78,7 +79,8 @@ poll. Past it podd
 kills exactly the job's session (`pkill -9 -s`), never a neighbour's.
 KEEP PARTIAL WORK. A job interrupted -- podd stopped it (a slow pod,
 podd stopping), its deadline passed, or its pod failed it -- first pulls home every output that exists and
-command.log. Then a RESUMABLE job (job_contract `resumable`: run again with what came home, it does only the rest) is
+command.log. Then a RESUMABLE job (job_contract `resumable`: run again, told what is done by its `resume_from` files,
+it does only the rest; what came home stays home, 2026-10-21: it went back up at ~1 MB/s, 0.2-2.2 GB a job) is
 REQUEUED (JOB again, + its record in `attempts`, its command.log kept as <stage>/.podd/attempt-<n>.command.log) when
 should_requeue says so (a deadline only after progress; at most MAX_ATTEMPTS), and any other FAILS with what came
 home.
@@ -810,16 +812,27 @@ def kill_the_job(pod, remote):
 
 
 def pull_back(pod, remote, stage, job):
-    """Every listed output that exists on the pod, and command.log, into the stage (each output replaced by the pod's
-    copy); the missing outputs."""
+    """Every listed output that exists on the pod, and command.log, into the stage, LAID OVER the stage's copy (no
+    --delete: a file the attempt wrote replaces the stage's, a file only the stage has -- an earlier attempt's finished
+    unit, never shipped back up -- stays); the missing outputs."""
     listed = pod.ssh(f"cd {remote} && for path in {' '.join(shlex.quote(p) for p in job['outputs'])}; do "
                      f"[ -e \"$path\" ] && echo \"$path\"; done; true").stdout.split("\n")
     present = [path for path in listed if path]
-    # --delete: each pulled output is the pod's copy exactly (a resumed run folds and removes files an earlier pull
-    # brought home: raw/.resume)
-    transfer(["rsync", "-rtR", "--delete", *[f"{pod.ssh_alias}:{remote}/./{path}"
-                                             for path in present + [job_contract.COMMAND_LOG]], f"{stage}/"])
+    transfer(["rsync", "-rtR", *[f"{pod.ssh_alias}:{remote}/./{path}"
+                                 for path in present + [job_contract.COMMAND_LOG]], f"{stage}/"])
     return [path for path in job["outputs"] if path not in present]
+
+
+def bytes_under(stage, paths):
+    """The bytes of these stage paths (files, directories whole): what a ship sends up this machine's uplink."""
+    total = 0
+    for path in paths:
+        top = Path(stage) / path
+        if top.is_file():
+            total += top.stat().st_size
+        for directory, _, files in os.walk(top):
+            total += sum((Path(directory) / name).stat().st_size for name in files)
+    return total
 
 
 def command_log_tail(stage, lines=30):
@@ -831,7 +844,8 @@ def command_log_tail(stage, lines=30):
 
 def run_the_job(stage, job, pod, running):
     """Ship, start, wait for the exit, pull, then DONE; or, interrupted, pull what exists and REQUEUE or FAIL.
-    A resumable job's outputs already in the stage (an earlier attempt's) are shipped with its inputs. Interrupted:
+    A resumable job's `resume_from` files already in the stage are shipped with its inputs (never the rest of what
+    earlier attempts brought home: the pull lays the new outputs over it). Interrupted:
     podd stopped it (JobStopped: a slow pod, podd stopping), its deadline passed (JobTimedOut), or its pod failed it
     (ssh, rsync: the pod is BROKEN, takes no more jobs and is deleted once empty); each pulls back every output that
     exists and command.log first, then should_requeue says JOB again or FAILED. The job's own failure (a non-zero exit,
@@ -846,18 +860,18 @@ def run_the_job(stage, job, pod, running):
         # a clean directory: a stage run again on the same pod finds its last run's files there otherwise (2026-10-16:
         # four requeued jobs found the killed runs' outputs and their command refused them, "Result directory already exists")
         pod.ssh(f"rm -rf {remote} && mkdir -p {remote}/.podd")
-        shipped = list(job["inputs"])
-        if job.get("resumable"):                         # what earlier attempts finished goes back with it
-            shipped += [path for path in job["outputs"] if (stage / path).exists()]
+        # what earlier attempts finished stays home: only the files that say what it is go up (resume_from)
+        resumed_from = [path for path in job.get("resume_from") or [] if (stage / path).exists()]
+        shipped = list(job["inputs"]) + resumed_from
+        timings["ship_bytes"] = bytes_under(stage, shipped)
         if shipped:
             transfer(["rsync", "-rtR", *[f"{stage}/./{path}" for path in shipped], f"{pod.ssh_alias}:{remote}/"])
         pod.ssh(f"cat > {remote}/.podd/command", input_text=job["command"] + "\n")
         pod.ssh(f"nohup setsid bash {RUNNER_ON_THE_POD} {remote} >/dev/null 2>&1 < /dev/null &")
         started = True
         timings["ship_s"] = round(time.time() - started_s, 1)
-        say(f"{label}: running on {pod.name} (attempt {attempt}), shipped in {timings['ship_s']} s"
-            f"{' with ' + str(len(shipped) - len(job['inputs'])) + ' output(s) of earlier attempts' if attempt > 1 else ''}"
-            f": {job['command']}")
+        say(f"{label}: running on {pod.name} (attempt {attempt}), shipped {timings['ship_bytes'] / 1e6:.1f} MB in "
+            f"{timings['ship_s']} s{f' (resume_from: {resumed_from})' if resumed_from else ''}: {job['command']}")
         waiting_started_s = time.time()
         read = f"cat {remote}/.podd/exit 2>/dev/null; "
         if "progress" in job:

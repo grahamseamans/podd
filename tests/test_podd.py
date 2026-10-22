@@ -884,7 +884,7 @@ def test_pod_sh_create_cpu_asks_runpod_for_a_cpu_pod_of_the_flavors_and_vcpu():
 def a_resumable_cpu_job(**changes):
     return a_cpu_job(**{"command": "bash solve.sh request.json 4", "inputs": ["in"],
                         "outputs": ["raw", "solve.log"], "expected_s": 1150, "progress": "progress",
-                        "resumable": True, **changes})
+                        "resumable": True, "resume_from": ["raw/manifest.json", "solve.log"], **changes})
 
 
 def test_the_contract_requires_expected_s_and_checks_progress_and_resumable():
@@ -893,9 +893,15 @@ def test_the_contract_requires_expected_s_and_checks_progress_and_resumable():
     assert "no `expected_s`" in podjobs.job_problems(no_expected)
     problems = "\n".join(podjobs.job_problems(a_job(resumable=True)) + podjobs.job_problems(
         a_job(progress="../p", resumable="yes", attempts={"a": 1})) + podjobs.job_problems(a_job(timeout_s=60)))
+    problems += "\n".join(podjobs.job_problems(a_resumable_cpu_job(resume_from=[]))
+                           + podjobs.job_problems({k: v for k, v in a_resumable_cpu_job().items() if k != "resume_from"})
+                           + podjobs.job_problems(a_resumable_cpu_job(resume_from=["build/manifest.json", "../x"]))
+                           + podjobs.job_problems(a_job(resume_from=["out/manifest.json"])))
     for words in ("`resumable` without `progress`", "`progress`: '../p' is not inside the stage",
                   "`resumable` 'yes' must be true or false", "`attempts` (podd's) must be a list",
-                  "unknown key `timeout_s`"):
+                  "unknown key `timeout_s`", "`resumable` without `resume_from`",
+                  "`resume_from` must be a non-empty list", "'build/manifest.json' is inside none of the outputs",
+                  "`resume_from`: '../x' is not inside the stage", "`resume_from` without `resumable` true"):
         assert words in problems, (words, problems)
 
 
@@ -1033,13 +1039,37 @@ def test_a_resumable_job_stopped_on_a_slow_pod_brings_its_work_home_and_is_reque
     assert (stage / "raw" / "000001.json").exists(), "the finished units came home"
     assert (stage / ".podd" / "attempt-1.command.log").read_text() == "solved 2 units\n"
     assert pod.state == "ready", "a slow pod is not a broken one"
-    # the next attempt ships the outputs already home with its inputs: it does only the rest
+    # the next attempt ships its inputs and the resume_from files ONLY: the finished units never go back up
+    # (2026-10-21: raw/ went back at ~1 MB/s, 0.2-2.2 GB a job, into the 600 s timeout)
+    (stage / "raw" / "manifest.json").write_text('{"done": [0, 1]}')
+    up = sum((stage / path).stat().st_size for path in ("in", "raw/manifest.json", "solve.log"))
     _, transfers = run_once(stage, requeued, a_running(stage, requeued), {"exit_status": 0, "wall_s": 40},
-                            pulled_raw=[f"{n:06d}" for n in range(115)])
+                            pulled_raw=[f"{n:06d}" for n in range(2, 115)])
     shipped = transfers[0]
-    assert f"{stage}/./in" in shipped and f"{stage}/./raw" in shipped and f"{stage}/./solve.log" in shipped, shipped
+    assert shipped == ["rsync", "-rtR", f"{stage}/./in", f"{stage}/./raw/manifest.json", f"{stage}/./solve.log",
+                       f"runpod-podd-c1:{podd.remote_directory(stage)}/"], shipped
     done = podjobs.read_state(stage, podjobs.DONE)
     assert len(done["attempts"]) == 1 and done["used"]["datacenter"] == "US-MD-1", done
+    assert done["timings"]["ship_bytes"] == up, (up, done["timings"])
+    assert all((stage / "raw" / f"{n:06d}.json").exists() for n in range(115)), "kept units + the new ones = all"
+
+
+def test_the_pull_lays_the_outputs_over_the_stage_and_deletes_nothing_there():
+    """A resumed attempt's pod holds only the units it did (and the resume_from files): the pull must keep the units
+    earlier attempts brought home, so it never --delete-s (the merge at home is podd's, by file)."""
+    stage = Path(tempfile.mkdtemp(prefix="podd-pull-"))
+    pod, transfers = FakeJobPod(stage), []
+    pod.ssh = lambda command, **options: subprocess.CompletedProcess(command, 0, "raw\nsolve.log\n", "")
+    saved = podd.transfer
+    podd.transfer = transfers.append
+    try:
+        missing = podd.pull_back(pod, "/workspace/jobs/x", stage, a_resumable_cpu_job())
+    finally:
+        podd.transfer = saved
+    assert missing == [] and transfers == [["rsync", "-rtR", "runpod-podd-c1:/workspace/jobs/x/./raw",
+                                            "runpod-podd-c1:/workspace/jobs/x/./solve.log",
+                                            f"runpod-podd-c1:/workspace/jobs/x/./{podjobs.COMMAND_LOG}", f"{stage}/"]], \
+        transfers
 
 
 def test_a_stopped_job_that_is_not_resumable_fails_with_what_it_wrote():
