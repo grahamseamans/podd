@@ -60,8 +60,9 @@ pod.sh, no ssh, no rsync.
 - `boot_seconds` (default 150, the measured 97-155 s): podd opens another pod only while the backlog would take
   longer than this to drain on the pods up or booting.
 - `max_wait_for_stock_minutes` (default 60): RunPod refusing a create for stock ("no instances currently available")
-  is waited out, never a failure: the jobs stay JOB and podd retries one pod after 60 s, doubling to 10 min. A set
-  with no pod for this long FAILS its jobs with every miss.
+  is waited out, never a failure: the jobs stay JOB and podd retries one pod after 60 s, doubling to 10 min, avoiding
+  no datacenter (not even a slow one). While a pod of the set runs, its jobs wait for it however long; a set with NO
+  pod for this long FAILS its jobs with every miss. `podd status` shows each wait and when it would fail.
 
 ## A job
 
@@ -85,7 +86,9 @@ traceback, command.log's tail), or back to `JOB` (a resumable job podd stopped p
 - `expected_s` (required): its wall time ALONE on a FAST host. podd's drain estimate, and the deadline:
   `TIMEOUT_MARGIN` 4 x expected_s x the pod's measured slowness x the most jobs the pod ran at once during it.
 - `progress` (optional): a file the command keeps rewriting as `<done> <total>`; podd measures the pod's speed from
-  it. `resumable` (optional, with `progress`): run again with the outputs an earlier attempt brought home, the command
+  it: the job's pace (seconds per unit over expected_s / total) against the median pace of at least 2 other pods
+  running the same command at the same load. At 1.5x that the pod is SLOW. So keep expected_s in proportion across a
+  command's jobs: a job twice the work says twice the expected_s. `resumable` (optional, with `progress`): run again with the outputs an earlier attempt brought home, the command
   does only the rest.
 
 A CPU job (`requires.gpu: "none"`, `gpu_memory_gb` 0) runs on a CPU pod that podd sizes from the set's waiting jobs
@@ -147,7 +150,7 @@ the pod has work): the backstop for a podd that died.
 |---|---|
 | `~/.config/podd/config.json` | the config (read once, at start) |
 | `~/.local/state/podd/PODS.json` | the pool, rewritten whenever it changes (no secrets); `podd status` prints it |
-| `~/.local/state/podd/slow-datacenters.json` | datacenters a SLOW pod was in, avoided for `SLOW_DATACENTER_HOURS` (delete an entry to forgive one, then restart) |
+| `~/.local/state/podd/slow-datacenters.json` | `{"gpu" \| "cpu": {datacenter: ...}}`: datacenters a SLOW pod of that kind was in, avoided by that kind's creates for `SLOW_DATACENTER_HOURS` unless the set is short of stock (delete an entry to forgive one, then restart) |
 | `$SECRETS/runpod_api_key`, `$SECRETS/runpod_pods/` | the key, and pod.sh's per-pod files |
 
 ## Tests

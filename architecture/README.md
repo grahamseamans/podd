@@ -72,9 +72,10 @@ THE PATTERN.
   ram_gb) and the flavors' prices (cpu_pod_plan); a GPU pod never serves a CPU set nor a CPU pod a card's set.
   Everything else (facts, packing, idle, stock) is the GPU pods'.
 - Short of stock is waited out, not failed: pod.sh create exits 75 when RunPod has no instance of any card offered
-  (2026-10-14: six jobs FAILED on one "no instances currently available"); the jobs stay JOB, podd says it loudly and
-  retries one pod after 60 s doubling to 10 min, and only a set with no pod for max_wait_for_stock_minutes FAILS, with
-  every miss.
+  (2026-10-14: six jobs FAILED on one "no instances currently available"); the jobs stay JOB, podd says it loudly (and
+  in the status file) and retries one pod after 60 s doubling to 10 min, avoiding no datacenter, and only a set with
+  NO pod for max_wait_for_stock_minutes FAILS, with every miss: the clock runs only while no pod serves the set
+  (2026-10-22: 20 jobs FAILED while 3 pods of their set ran).
 - Nothing fails quietly: every failure is a FAILED file (and the journal for podd's); a stage that failed stays until
   a person reads it and deletes it by name. A failure on one pod fails only its jobs; a pod whose ssh or rsync failed
   is BROKEN: it takes no more jobs and is deleted once empty. A job's own failure (non-zero exit, a missing output) is
@@ -83,11 +84,15 @@ THE PATTERN.
   (podd stopped it, its deadline, its pod broke, podd stopping) pulls home every output that exists first. Only a job
   that declares itself `resumable` is requeued -- by the daemon, the one writer of that JOB, with an `attempts` record
   -- and its next attempt gets those outputs back and does the rest; at most MAX_ATTEMPTS.
-- Slow hosts are caught, not waited out: from a job's `progress` podd measures its pod against the fastest pod running
-  the same command with as many jobs at once (alone: the job's expected_s; packing is never slowness); at SLOW_FACTOR
-  (1.5; measured 6.7-8.9 vs 14.6-20 s a unit, 2026-10-16) the pod is SLOW, serves nothing (so the opening rule
-  replaces it), moves its resumable jobs, goes once empty, and its datacenter is avoided for SLOW_DATACENTER_HOURS
-  (~/.local/state/podd/slow-datacenters.json).
+- Slow hosts are caught, not waited out: from a job's `progress` podd measures its PACE (seconds per unit over the
+  job's own expected seconds per unit: one command runs jobs of many sizes) against the MEDIAN pace of at least
+  MIN_REFERENCE_PODS other pods running the same command with as many jobs at once (packing is never slowness; never
+  the fastest pod, never expected_s alone: 2026-10-21, 15 datacenters banned in a day, US-GA-2 the one with CPU stock
+  among them); at SLOW_FACTOR (1.5; measured 2026-10-16 and 2026-10-21, daemon.py) the pod is SLOW, serves nothing (so
+  the opening rule replaces it), moves the resumable jobs a move saves more than a boot, goes once empty, and its
+  datacenter is avoided by creates of its kind (gpu / cpu) for SLOW_DATACENTER_HOURS
+  (~/.local/state/podd/slow-datacenters.json). A set short of stock keeps its slow pod and avoids nothing: a slow pod
+  is better than none.
 - A failed pod delete is said loudly and retried every minute, never podd's end (2026-10-15: one RunPod HTTP 500 on
   a DELETE stopped podd, failing two running jobs on other pods and leaving two pods billing).
 - Pods never outlive their work: idle -> deleted, podd stopped -> deleted (a booting create is stopped first), podd

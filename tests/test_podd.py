@@ -3,11 +3,13 @@ checked, a pod satisfies a job only when every requirement is met (the image's d
 any of them), a job goes to the fullest pod that satisfies it, jobs are packed on a pod by cpu / gpu memory / ram (best
 fit), pods are opened PER REQUIREMENT SET only while its backlog would outlast a boot (the drain time), offered every
 card under the price cap (in-stock first, cheapest first) and never one over it, RunPod short of stock leaves the jobs
-queued and retries after a backoff until max_wait_for_stock_minutes, a job requiring an image no running pod has opens a pod for that image, a pod's facts are read
+queued and retries after a backoff (avoiding no datacenter) until max_wait_for_stock_minutes, a job requiring an image no running pod has opens a pod for that image, a pod's facts are read
 from what it prints (CPU quota, decimal GB, shadowing refused), the exit poll ends, a pod's ssh is through its own
 alias, a job requiring no card (requires.gpu "none") runs on a CPU pod sized by its jobs' cpu and RAM under the
 cap and created through pod.sh create-cpu (its real request body, against a fake curl), an interrupted job brings
-its outputs home and a resumable one is requeued to do the rest, a pod much slower than the fastest is marked slow, moved off, replaced and its datacenter avoided, the deadline
+its outputs home and a resumable one is requeued to do the rest, a pod much slower than the median of the others (by pace, never by expected_s alone) is marked slow, moved off,
+replaced and its datacenter avoided (never while its set is short of stock), a set short of stock fails only after
+max_wait_for_stock_minutes with no pod, the deadline
 scales with expected_s and the pod's slowness, and podd imports nothing but the standard library.
 
     PYTHONPATH=src /usr/bin/python3 tests/test_podd.py      (from the repo root; or with podd installed)
@@ -432,7 +434,7 @@ def test_a_set_short_of_stock_past_max_wait_fails_its_jobs_with_every_miss():
             refused_for_stock(pool)
             pool.step()
             assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
-            next(iter(pool.short_of_stock.values())).first_miss_s -= 61 * 60
+            next(iter(pool.short_of_stock.values())).podless_since_s -= 61 * 60
             pool.step()
     finally:
         podd.Pod, podd.STATUS_FILE = saved
@@ -442,6 +444,73 @@ def test_a_set_short_of_stock_past_max_wait_fails_its_jobs_with_every_miss():
         assert "max_wait_for_stock_minutes" in reason and "no instances currently available" in reason, reason
         assert "NVIDIA RTX A5000, NVIDIA A40, NVIDIA RTX A4500" in reason, "the cards offered are in the story"
     assert not pool.short_of_stock
+
+
+def test_a_set_short_of_stock_never_fails_while_a_pod_of_it_runs_and_its_clock_starts_when_none_does():
+    """2026-10-22 00:15Z: 20 jobs FAILED "no pod for 60 min" while 3 pods of their set ran other chunks."""
+    root = Path(tempfile.mkdtemp(prefix="podd-stock-"))
+    pool, queue_directory = stock_pool(root, jobs=2)
+    saved = podd.Pod, podd.STATUS_FILE
+    podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            pool.step()
+            refused_for_stock(pool)
+            pool.step()
+            wait = next(iter(pool.short_of_stock.values()))
+            key = next(iter(pool.short_of_stock))
+            working = podd.Pod("podd-g8", pool.secrets, json.loads(key), pool.config, attempt=0)
+            working.created, working.state, working.facts = True, "ready", dict(FACTS_A, pod_name="podd-g8")
+            pool.pods["podd-g8"] = working
+            (pool.secrets / podd.PODS_DIRECTORY_NAME / "podd-g8.id").write_text("pod-a\n")
+            busy = on_pod(pool, "other-chunk", "podd-g8", a_job(cpu="all", expected_s=75, progress="progress"), 1.0)
+            wait.first_miss_s -= 3 * 3600
+            wait.podless_since_s -= 3 * 3600                    # hours short of stock: and a pod of the set runs
+            wait.retry_at_s = time.time() + 600
+            pool.step()
+            assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir()), \
+                said.getvalue()[-600:]
+            assert wait.podless_since_s is None and pool.short_of_stock, "the set has a pod: the clock is off"
+            status = json.loads((root / "PODS.json").read_text())["short_of_stock"]
+            assert status[key]["no_pod_since"] is None and status[key]["misses"] == 1, status
+            del pool.running["/q/other-chunk"], pool.pods["podd-g8"]       # its last pod went
+            (pool.secrets / podd.PODS_DIRECTORY_NAME / "podd-g8.id").unlink()
+            pool.step()
+            assert wait.podless_since_s is not None and "now with no pod" in said.getvalue()
+            assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
+            assert json.loads((root / "PODS.json").read_text())["short_of_stock"][key]["fails_at"]
+            wait.podless_since_s -= 61 * 60
+            pool.step()
+    finally:
+        podd.Pod, podd.STATUS_FILE = saved
+    assert busy.stop is None
+    assert all(podjobs.stage_state(stage) == podjobs.FAILED for stage in queue_directory.iterdir()), \
+        "no pod for max_wait_for_stock_minutes: the README's give-up"
+
+
+def test_a_set_short_of_stock_avoids_no_datacenter_and_a_cpu_ban_never_reaches_a_gpu_create():
+    """2026-10-21: 15 datacenters avoided (US-GA-2, the one with CPU stock, among them): RunPod refused every create,
+    and the CPU pods' bans cut the GPU creates too."""
+    root = Path(tempfile.mkdtemp(prefix="podd-stock-"))
+    pool, _ = stock_pool(root, jobs=1)
+    record = {"until_unix": time.time() + 3600, "until": "later", "why": "test", "pod": "podd-c1"}
+    pool.slow_datacenters = {"cpu": {"US-GA-2": dict(record)}, "gpu": {"US-MD-1": dict(record)}}
+    saved = podd.Pod, podd.STATUS_FILE
+    podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            pool.step()
+            first = next(iter(pool.pods.values()))
+            assert first.create_command()[-1] == "US-MD-1", "a GPU create avoids the GPU bans only"
+            refused_for_stock(pool)
+            pool.step()
+            next(iter(pool.short_of_stock.values())).retry_at_s = 0
+            pool.step()
+            probe = next(iter(pool.pods.values()))
+    finally:
+        podd.Pod, podd.STATUS_FILE = saved
+    assert probe.avoid_datacenters == [] and len(probe.create_command()) == 7, probe.create_command()
+    assert "avoids no datacenter" in said.getvalue(), said.getvalue()[-600:]
 
 
 def test_pod_sh_create_exiting_75_is_a_stock_miss_with_runpods_answer_not_a_boot_failure():
@@ -855,15 +924,26 @@ def test_a_jobs_rate_counts_from_its_first_finished_unit_over_enough_units_and_s
     assert said.getvalue().count("not `<done> <total>`") == 1, said.getvalue()
 
 
-def test_the_reference_is_the_fastest_other_pod_at_the_same_load_else_expected_s_alone_else_none():
-    job = a_resumable_cpu_job(expected_s=1150)
-    assert podd.reference_seconds_per_unit(job, 115, 1, [])[0] == 10.0
-    assert podd.reference_seconds_per_unit(job, 115, 2, [(7.8, 2), (8.9, 2), (17.0, 2), (3.0, 1)])[0] == 7.8
-    assert podd.reference_seconds_per_unit(job, 115, 20, [(0.22, 1), (0.25, 3)]) is None, \
-        "a pod running 20 jobs at once has no fair reference: it is not judged"
-    # the measured spread (s per unit): every fast host under SLOW_FACTOR x the fastest, every slow one over
-    assert all(fast / 6.7 < podd.SLOW_FACTOR for fast in (6.7, 7.8, 8.9))
-    assert all(slow / 8.9 >= podd.SLOW_FACTOR for slow in (14.6, 20.0))
+def test_the_reference_is_the_median_pace_of_other_pods_at_the_same_load_never_expected_s_alone():
+    job, now = a_resumable_cpu_job(expected_s=1150), 10_000.0
+    assert podd.pace_of(10.0, job, 115) == 1.0 and podd.pace_of(5.0, job, 115) == 0.5, "over its own expected s a unit"
+    assert podd.reference_pace(1, {}, now) is None, "expected_s alone is no reference (2026-10-21: 3x off)"
+    assert podd.reference_pace(1, {"a#1": (0.7, 1, "pod-a", now)}, now) is None, "one other pod is too few"
+    others = {"a#1": (0.7, 2, "pod-a", now), "a#2": (0.8, 2, "pod-a", now), "b#1": (0.9, 2, "pod-b", now),
+              "c#1": (3.0, 2, "pod-c", now), "d#1": (0.1, 1, "pod-d", now), "e#1": (0.1, 2, "pod-e", now - 7200)}
+    assert podd.reference_pace(2, others, now) == (0.9, 3), "the median over pods of each pod's median pace"
+    assert podd.reference_pace(20, others, now) is None, "a pod running 20 jobs at once has no fair reference"
+    # the measured spreads: every normal host under SLOW_FACTOR x the median, every slow one over
+    fast_2026_10_16, slow_2026_10_16 = (6.7, 7.8, 8.9), (14.6, 20.0)          # s a unit, one job shape
+    assert all(rate / podd.median(fast_2026_10_16) < podd.SLOW_FACTOR for rate in fast_2026_10_16)
+    assert all(rate / podd.median(fast_2026_10_16) >= podd.SLOW_FACTOR for rate in slow_2026_10_16)
+    normal_2026_10_21 = (0.24, 0.25, 0.27, 0.29, 0.35, 0.38, 0.40, 0.42, 0.45, 0.47, 0.48, 0.52)    # pace
+    slow_2026_10_21 = (0.69, 0.77, 0.79)                                     # US-MO-1, US-CA-2
+    assert all(pace / 0.40 < podd.SLOW_FACTOR for pace in normal_2026_10_21)
+    assert all(pace / 0.40 >= podd.SLOW_FACTOR for pace in slow_2026_10_21)
+    assert not podd.worth_moving((124 - 64) * 6.0, 1.1, 150), "a little slow, half done: it runs on"
+    assert not podd.worth_moving((115 - 110) * 17.0, 2.0, 150), "twice as slow, near its end: it runs on"
+    assert podd.worth_moving((115 - 12) * 17.0, 2.0, 150)
 
 
 def test_wait_for_the_exit_hands_over_progress_stops_when_told_and_rereads_the_deadline():
@@ -993,7 +1073,7 @@ def test_a_deadline_requeues_a_resumable_job_only_when_it_made_progress_and_neve
     assert not podd.should_requeue(a_job(), "slow pod", progressed=True)
 
 
-def slow_pool(root):
+def slow_pool(root, pods=(("podd-c1", "EU-RO-1"), ("podd-c2", "US-MD-1"))):
     queue_directory, secrets = root / "queue", root / "secrets"
     (secrets / podd.PODS_DIRECTORY_NAME).mkdir(parents=True)
     queue_directory.mkdir(parents=True)
@@ -1002,7 +1082,7 @@ def slow_pool(root):
               "allowed_cuda_versions": ["12.8"], "cpu_flavors": ["cpu3c"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))
-    for name, datacenter in (("podd-c1", "EU-RO-1"), ("podd-c2", "US-MD-1")):
+    for name, datacenter in pods:
         pod = podd.Pod(name, secrets, CPU_REQUIRES, config)
         pod.state, pod.facts = "ready", dict(FACTS_CPU, pod_name=name, pod_id=f"id-{name}", datacenter=datacenter)
         (secrets / podd.PODS_DIRECTORY_NAME / f"{name}.id").write_text(f"id-{name}\n")
@@ -1018,24 +1098,21 @@ class Alive:
         pass
 
 
-def on_pod(pool, stage_name, pod_name, job, seconds_per_unit, units=12, load=1):
+def on_pod(pool, stage_name, pod_name, job, seconds_per_unit, units=12, load=1, total=115):
     running = podd.Running(Alive(), pod_name, podd.demand_of(job, podd.capacity_of(FACTS_CPU)), job, time.time(),
                            f"/q/{stage_name}#1")
     running.load = running.peak_load = load
-    running.saw_progress("0 115", 0)
+    running.saw_progress(f"0 {total}", 0)
     for done in range(1, units + 1):
-        running.saw_progress(f"{done} 115", 600 + done * seconds_per_unit)
+        running.saw_progress(f"{done} {total}", 600 + done * seconds_per_unit)
     pool.running[f"/q/{stage_name}"] = running
     return running
 
 
-def test_a_pod_much_slower_than_the_fastest_is_marked_slow_its_resumable_jobs_moved_and_its_datacenter_avoided():
-    root = Path(tempfile.mkdtemp(prefix="podd-slow-"))
-    pool, _ = slow_pool(root)
-    fast = on_pod(pool, "c0", "podd-c1", a_resumable_cpu_job(), 7.8, load=2)          # two jobs a pod, as 2026-10-15
-    on_pod(pool, "c3", "podd-c1", a_resumable_cpu_job(), 8.9, load=2)
-    slow_resumable = on_pod(pool, "c1", "podd-c2", a_resumable_cpu_job(), 17.0, load=2)
-    slow_fixed = on_pod(pool, "c2", "podd-c2", a_resumable_cpu_job(resumable=False, label="a short job"), 17.0, load=2)
+THREE_PODS = (("podd-c1", "EU-RO-1"), ("podd-c2", "US-MD-1"), ("podd-c3", "CA-MTL-1"))
+
+
+def judged(pool, root):
     saved = podd.STATUS_FILE
     podd.STATUS_FILE = root / "PODS.json"
     try:
@@ -1044,26 +1121,83 @@ def test_a_pod_much_slower_than_the_fastest_is_marked_slow_its_resumable_jobs_mo
             pool.judge_speeds()                                     # said once, not every pass
     finally:
         podd.STATUS_FILE = saved
-    assert pool.pods["podd-c1"].state == "ready" and fast.stop is None and fast.slowness < 1
+    return said.getvalue()
+
+
+def test_a_pod_much_slower_than_the_median_is_marked_slow_its_resumable_jobs_moved_and_its_datacenter_avoided():
+    root = Path(tempfile.mkdtemp(prefix="podd-slow-"))
+    pool, _ = slow_pool(root, THREE_PODS)
+    fast = on_pod(pool, "c0", "podd-c1", a_resumable_cpu_job(), 7.8, load=2)          # two jobs a pod, as 2026-10-15
+    on_pod(pool, "c3", "podd-c3", a_resumable_cpu_job(), 8.9, load=2)
+    slow_resumable = on_pod(pool, "c1", "podd-c2", a_resumable_cpu_job(), 17.0, load=2)
+    slow_fixed = on_pod(pool, "c2", "podd-c2", a_resumable_cpu_job(resumable=False, label="a short job"), 17.0, load=2)
+    nearly_done = on_pod(pool, "c4", "podd-c2", a_resumable_cpu_job(label="nearly done"), 17.0, units=110, load=2)
+    said = judged(pool, root)
+    assert pool.pods["podd-c1"].state == "ready" and fast.stop is None and fast.slowness < 1, fast.slowness
     slow = pool.pods["podd-c2"]
-    assert slow.state == "slow" and slow.slowness == round(17.0 / 7.8, 2), (slow.state, slow.slowness)
+    assert slow.state == "slow" and slow.slowness == round(1.7 / ((0.78 + 0.89) / 2), 2), (slow.state, slow.slowness)
     assert slow_resumable.stop and slow_resumable.stop[0] == "slow pod", "moved: what it finished comes home"
     assert slow_fixed.stop is None, "a job that cannot resume runs on, under a deadline scaled by the slowness"
-    assert said.getvalue().count("IS SLOW") == 1 and "US-MD-1 is recorded SLOW" in said.getvalue(), said.getvalue()
-    assert "deadline is now" in said.getvalue()
+    assert nearly_done.stop is None and "saves less than a boot" in said, said
+    assert said.count("IS SLOW") == 1 and "US-MD-1 is recorded SLOW for cpu pods" in said, said
+    assert "deadline is now" in said
     assert podd.job_deadline_s(slow_fixed.job, slow.slowness, 2) > podd.job_deadline_s(slow_fixed.job, 1.0, 2)
     recorded = json.loads(podd.SLOW_DATACENTERS_FILE.read_text())
-    assert list(recorded) == ["US-MD-1"] and recorded["US-MD-1"]["until_unix"] > time.time(), recorded
+    assert list(recorded) == ["cpu"] and list(recorded["cpu"]) == ["US-MD-1"], recorded
+    assert recorded["cpu"]["US-MD-1"]["until_unix"] > time.time()
     assert podd.read_slow_datacenters() == recorded, "kept across a restart"
-    assert pool.avoided_datacenters() == ["US-MD-1"]
+    assert pool.avoided_datacenters("cpu") == ["US-MD-1"] and pool.avoided_datacenters("gpu") == []
     # a slow pod serves no set: placement skips it, the opening rule replaces it, and the new pod avoids US-MD-1
-    pod = podd.Pod("podd-c3", pool.secrets, CPU_REQUIRES, pool.config, ["cpu3c"], 1, 8, pool.avoided_datacenters())
-    assert pod.create_command()[1:] == ["create-cpu", "podd-c3", IMAGE_A, "cpu3c", "8", "US-MD-1"]
-    pool.slow_datacenters["US-MD-1"]["until_unix"] = time.time() - 1
+    pod = podd.Pod("podd-c4", pool.secrets, CPU_REQUIRES, pool.config, ["cpu3c"], 1, 8,
+                   pool.avoided_datacenters("cpu"))
+    assert pod.create_command()[1:] == ["create-cpu", "podd-c4", IMAGE_A, "cpu3c", "8", "US-MD-1"]
+    pool.slow_datacenters["cpu"]["US-MD-1"]["until_unix"] = time.time() - 1
     with contextlib.redirect_stdout(io.StringIO()) as said:
-        assert pool.avoided_datacenters() == [], "avoided for SLOW_DATACENTER_HOURS, then forgiven"
+        assert pool.avoided_datacenters("cpu") == [], "avoided for SLOW_DATACENTER_HOURS, then forgiven"
     assert "no longer avoided" in said.getvalue()
     podd.SLOW_DATACENTERS_FILE.unlink()
+
+
+def test_jobs_of_one_command_and_different_sizes_are_compared_by_pace_not_seconds_per_unit():
+    """2026-10-21 16:13:50: five pods marked SLOW at once, large jobs (expected_s 3712 s, 124 units) at 6.5-7.0 s a
+    unit against 3.9 s a unit measured on a smaller job of the same command."""
+    root = Path(tempfile.mkdtemp(prefix="podd-slow-"))
+    pool, _ = slow_pool(root, THREE_PODS)
+    on_pod(pool, "small-c0", "podd-c1", a_resumable_cpu_job(expected_s=1411), 2.8, units=60, total=124)
+    on_pod(pool, "small-c1", "podd-c3", a_resumable_cpu_job(expected_s=1411), 2.9, units=60, total=124)
+    large = on_pod(pool, "large-c1", "podd-c2", a_resumable_cpu_job(expected_s=3712), 7.0, units=30, total=124)
+    said = judged(pool, root)
+    assert "IS SLOW" not in said and large.stop is None and large.slowness < podd.SLOW_FACTOR, (large.slowness, said)
+
+
+def test_a_pod_in_the_normal_spread_is_not_slow_against_the_fastest_one():
+    """2026-10-21 15:29: three US-GA-2 pods marked SLOW at 1.50-1.53x one US-IL-1 pod; whole jobs there ran at pace
+    0.35 against US-IL-1's 0.24 and every other datacenter's 0.24-0.52."""
+    root = Path(tempfile.mkdtemp(prefix="podd-slow-"))
+    pool, _ = slow_pool(root, (("podd-c1", "US-IL-1"), ("podd-c2", "US-GA-2"), ("podd-c3", "US-GA-2")))
+    for n, (pod_name, rate) in enumerate((("podd-c1", 7.0), ("podd-c2", 10.5), ("podd-c3", 10.9))):
+        on_pod(pool, f"large-2s-c{n}", pod_name, a_resumable_cpu_job(expected_s=3712), rate, units=14, total=124)
+    said = judged(pool, root)
+    assert all(pod.state == "ready" for pod in pool.pods.values()) and "IS SLOW" not in said, said
+
+
+def test_a_lone_pod_is_never_slow_by_expected_s_and_a_set_short_of_stock_keeps_its_slow_pod():
+    """2026-10-21 10:03: US-CA-2 banned at 2.49x a client's expected_s, which was 3x off; 2026-10-21 23:15-02:33:
+    pods stopped as slow while RunPod had no stock to replace them."""
+    root = Path(tempfile.mkdtemp(prefix="podd-slow-"))
+    pool, _ = slow_pool(root, (("podd-c1", "US-CA-2"),))
+    lone = on_pod(pool, "small-c0", "podd-c1", a_resumable_cpu_job(expected_s=392), 7.9, units=10, total=124)
+    said = judged(pool, root)
+    assert pool.pods["podd-c1"].state == "ready" and "IS SLOW" not in said and lone.stop is None, said
+    assert lone.slowness == 2.5 and pool.pods["podd-c1"].slowness == 2.5, "its pace still scales its deadline"
+    pool, _ = slow_pool(root / "kept", THREE_PODS)
+    on_pod(pool, "c0", "podd-c1", a_resumable_cpu_job(), 7.8)
+    on_pod(pool, "c3", "podd-c3", a_resumable_cpu_job(), 8.9)
+    slow_job = on_pod(pool, "c1", "podd-c2", a_resumable_cpu_job(), 17.0)
+    pool.short_of_stock[podd.requirement_key(CPU_REQUIRES)] = podd.StockWait(time.time())
+    said = judged(pool, root)
+    assert pool.pods["podd-c2"].state == "ready" and slow_job.stop is None, "nothing would replace it: kept"
+    assert said.count("KEPT") == 1 and not podd.SLOW_DATACENTERS_FILE.exists(), said
 
 
 def test_twenty_jobs_packed_on_one_a40_are_neither_killed_nor_marked_slow():
@@ -1096,16 +1230,19 @@ def test_twenty_jobs_packed_on_one_a40_are_neither_killed_nor_marked_slow():
     # judged only against its equals (its 19 neighbours, once measured): the 3-at-once pod is no reference for it
     assert all(running.stop is None and running.slowness in (None, 1.0) for running in packed)
     assert podd.job_deadline_s(packed_job, pool.pods["podd-c2"].slowness, packed[0].peak_load) > packed_s
-    # at EQUAL load a slow pod is still caught: a third pod of 20 at twice the packed rate
-    pool.pods["podd-c3"] = podd.Pod("podd-c3", pool.secrets, CPU_REQUIRES, pool.config)
-    pool.pods["podd-c3"].state = "ready"
-    pool.pods["podd-c3"].facts = dict(FACTS_A, pod_name="podd-c3", pod_id="id-podd-c3", datacenter="US-MD-1", cpu=50.0)
-    (pool.secrets / podd.PODS_DIRECTORY_NAME / "podd-c3.id").write_text("id-podd-c3\n")
-    for n in range(20):
-        on_pod(pool, f"slow-{n}", "podd-c3", packed_job, 2 * (packed_s - 50) / 92, units=40, load=20)
+    # at EQUAL load a slow pod is still caught: against two pods of 20, a pod of 20 at twice the packed rate
+    for name, datacenter, rate in (("podd-c4", "CA-MTL-1", (packed_s - 50) / 92),
+                                   ("podd-c3", "US-MD-1", 2 * (packed_s - 50) / 92)):
+        pool.pods[name] = podd.Pod(name, pool.secrets, CPU_REQUIRES, pool.config)
+        pool.pods[name].state = "ready"
+        pool.pods[name].facts = dict(FACTS_A, pod_name=name, pod_id=f"id-{name}", datacenter=datacenter, cpu=50.0)
+        (pool.secrets / podd.PODS_DIRECTORY_NAME / f"{name}.id").write_text(f"id-{name}\n")
+        for n in range(20):
+            on_pod(pool, f"{name}-{n}", name, packed_job, rate, units=40, load=20)
     with contextlib.redirect_stdout(io.StringIO()):
         pool.judge_speeds()
     assert pool.pods["podd-c3"].state == "slow" and pool.pods["podd-c2"].state == "ready"
+    assert pool.pods["podd-c4"].state == "ready"
     podd.SLOW_DATACENTERS_FILE.unlink()
 
 

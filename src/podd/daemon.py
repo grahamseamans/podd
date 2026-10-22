@@ -47,16 +47,18 @@ per job is the lowest; create is offered every flavor that holds the same jobs a
 first, cheapest first. A booting CPU pod's capacity is that plan. Facts, packing, idling and stock are the GPU pods'.
 SHORT OF STOCK IS NOT A FAILURE. pod.sh create exits POD_SH_NO_STOCK_EXIT when RunPod has no instance of any card
 offered; podd says so loudly once per attempt, the set's jobs stay JOB, and its next create waits
-stock_backoff_seconds (60 s doubling to 10 min) and is ONE pod (a probe, not a burst) until a create succeeds. No card
-under the cap counts the same way. A set short of stock for more than max_wait_for_stock_minutes FAILS its waiting
-jobs with every miss (time, cards offered, RunPod's answer). A pod whose facts do not
+stock_backoff_seconds (60 s doubling to 10 min) and is ONE pod (a probe, not a burst), avoiding no datacenter, until a
+create succeeds. No card under the cap counts the same way. A set short of stock that has had NO pod (none ready or
+slow serving it, no job of it running) for more than max_wait_for_stock_minutes FAILS its waiting jobs with every miss
+(time, cards offered, RunPod's answer); while a pod serves it, they wait. The waits are in the status file. A pod whose facts do not
 satisfy the set it was opened for is deleted and the set's waiting jobs FAIL with the mismatch, as do later jobs of
 that set until podd restarts (a create loop would bill forever). A ready pod with no job for idle_minutes is deleted
 (a pod no job matches is simply idle). Pods are named podd-g1 .. podd-g<max_pods.gpu> and podd-c1 ..
 podd-c<max_pods.cpu> (pod.sh's name: its id file, lease,
 alias runpod-<name>).
 
-EACH POD'S LIFE. Booting: `pod.sh create` in its own thread (never in a datacenter recorded slow: below), then podd
+EACH POD'S LIFE. Booting: `pod.sh create` in its own thread (never in a datacenter recorded slow for its kind, unless
+its set is short of stock: below), then podd
 ships podd-run.sh and reads the facts. Ready: takes jobs. SLOW or BROKEN: takes no more, deleted once empty. Deleted
 after idle_minutes with no job, when a job on it failed for a reason of the pod's own (ssh, rsync: it is BROKEN), once
 SLOW and empty, or when podd stops (a booting create is stopped, its pod deleted). pod.sh's watchdog
@@ -81,12 +83,15 @@ REQUEUED (JOB again, + its record in `attempts`, its command.log kept as <stage>
 should_requeue says so (a deadline only after progress; at most MAX_ATTEMPTS), and any other FAILS with what came
 home.
 SLOW HOSTS (judge_speeds, every pass). A job with `progress` (`<done> <total>`) is measured from its first finished
-unit on (seconds_per_unit) against the fastest rate another attempt of the same command measured AT THE SAME LOAD (as
-many jobs on its pod), else, alone on its pod, its own expected_s / total, else not at all: a pod running N jobs at once
-is not slow for it. At SLOW_FACTOR or more its pod is SLOW (mark_slow): it takes no more jobs and serves no set (the
-opening rule replaces it), its resumable jobs are stopped and requeued (each at most MAX_SLOW_STOPS times), its
-others run on under the scaled deadline, and its datacenter goes in SLOW_DATACENTERS_FILE: pod.sh create avoids it for
-SLOW_DATACENTER_HOURS. A pod's slowness (the largest its jobs measured) scales its jobs' deadlines. All said loudly.
+unit on (seconds_per_unit); its PACE is that over its own expected seconds per unit (pace_of), judged against the
+MEDIAN pace of at least MIN_REFERENCE_PODS other pods running the same command AT THE SAME LOAD (as many jobs on its
+pod; reference_pace), else not at all: a pod running N jobs at once is not slow for it, and expected_s alone only
+scales a lone job's deadline. At SLOW_FACTOR or more its pod is SLOW (mark_slow) -- unless its set is short of stock
+(nothing would replace it: kept, said once): it takes no more jobs and serves no set (the opening rule replaces it),
+its resumable jobs are stopped and requeued when the move saves more than a boot (worth_moving; each at most
+MAX_SLOW_STOPS times), its others run on under the scaled deadline, and its datacenter goes in SLOW_DATACENTERS_FILE
+under its kind: that kind's creates avoid it for SLOW_DATACENTER_HOURS. A pod's slowness (the largest its jobs
+measured) scales its jobs' deadlines. All said loudly.
 
 NOTHING FAILS QUIETLY. A create that fails for anything but stock is said, and that set's next create waits
 CREATE_RETRY_SECONDS; when nothing up or booting could serve the set, its waiting jobs FAIL with the reason. A broken JOB (job_contract.job_problems) FAILS with
@@ -123,14 +128,23 @@ RESOURCES = ("cpu", "gpu_memory_gb", "ram_gb")       # what a job uses and a pod
 # overrun measured so far (223 s against 85 s expected, three CPU-bound jobs sharing a pod) and a stall still ends
 # (2026-10-05: 7.5 h of a 5090)
 TIMEOUT_MARGIN = 4
-# SLOW HOSTS. A job's seconds per unit of its `progress`, measured from its first finished unit on (start-up excluded)
-# over at least MIN_UNITS_TO_JUDGE units and MIN_SECONDS_TO_JUDGE seconds, at SLOW_FACTOR x the reference or more
-# marks its pod slow. Measured 2026-10-15/16 (one job shape, s per unit): fast hosts 6.7-8.9, slow
-# (US-MD-1) 14.6-20: 1.5 sits between the fast maximum (1.14x the fast median 7.8) and the slow minimum (1.87x).
+# SLOW HOSTS. A job's PACE: its seconds per unit of its `progress` (measured from its first finished unit on, start-up
+# excluded, over at least MIN_UNITS_TO_JUDGE units and MIN_SECONDS_TO_JUDGE seconds) over its own expected seconds per
+# unit (expected_s / total): jobs of one command differ in size (2026-10-21: one command ran jobs of expected_s 1273,
+# 1633 and 3218 s over 124 units, and per-unit rates compared across them marked five pods slow at once). A pace at
+# SLOW_FACTOR x the reference or more marks its pod slow; the reference is the MEDIAN pace of at least
+# MIN_REFERENCE_PODS other pods at the same load (never the fastest one: 2026-10-21, whole jobs of one shape ran at pace
+# 0.24 on US-IL-1 and 0.35 on US-GA-2, 1.46x, both normal; never expected_s alone: that day a client's expected_s was 3x
+# off).
+# Measured: 2026-10-15/16 (one job shape, s per unit) fast hosts 6.7-8.9, slow (US-MD-1) 14.6-20: the fast maximum is
+# 1.14x the fast median 7.8, the slow minimum 1.87x; 2026-10-21 (pace) normal 0.24-0.52 around a median ~0.40 (<= 1.3x),
+# slow US-MO-1 / US-CA-2 0.69-0.79 (>= 1.7x). 1.5 sits between.
 SLOW_FACTOR = 1.5
 MIN_UNITS_TO_JUDGE = 3
 MIN_SECONDS_TO_JUDGE = 60
-SLOW_DATACENTER_HOURS = 12           # a datacenter a slow pod was in: podd's creates avoid it this long
+MIN_REFERENCE_PODS = 2               # other pods with a measured pace at the same load before a pod is judged
+REFERENCE_MAX_AGE_SECONDS = 3600     # a pace measured longer ago is no reference (a client may revise its expected_s)
+SLOW_DATACENTER_HOURS = 12           # a datacenter a slow pod of a kind was in: podd's creates of that kind avoid it
 MAX_ATTEMPTS = 4                     # a resumable job's attempts (the first included); the last one FAILS, never loops
 MAX_SLOW_STOPS = 2                   # a job is moved off a slow pod at most this often (then it runs on where it is:
                                      # its expected_s may be optimistic, and every pod would look slow)
@@ -346,17 +360,45 @@ def seconds_per_unit(observations):
     return (last_s - first_s) / (last_done - first_done)
 
 
-def reference_seconds_per_unit(job, total, load, other_rates):
-    """What a pod of normal speed does AT THE SAME LOAD (pure): other_rates [(seconds per unit, load)] of other
-    attempts of the same command; the fastest of those measured with as many jobs on their pod as this one (robust to
-    an optimistic expected_s), else, for a job alone on its pod, its expected_s over its total units, else None: no
-    fair comparison, no judgement (a pod running N jobs at once is not slow for it). -> (seconds, where from) | None."""
-    at_load = [rate for rate, other_load in other_rates if other_load == load]
-    if at_load:
-        return min(at_load), f"the fastest other pod running the same command, {load} job(s) at once"
-    if load == 1:
-        return job["expected_s"] / total, f"its expected_s {job['expected_s']} s over {total} units, alone"
-    return None
+def pace_of(seconds_per_unit, job, total):
+    """A job's pace (pure): its measured seconds per unit over its own expected seconds per unit (expected_s / total).
+    1 = as expected_s says; comparable across the jobs of one command whatever their size."""
+    return seconds_per_unit / (job["expected_s"] / total)
+
+
+def reference_pace(load, others, now):
+    """What a pod of normal speed does AT THE SAME LOAD (pure): others {attempt key: (pace, load, pod id, measured
+    at)} of other pods' attempts of the same command -> (the MEDIAN over pods of each pod's median pace, how many
+    pods) when at least MIN_REFERENCE_PODS pods measured one at this load within REFERENCE_MAX_AGE_SECONDS, else None:
+    no fair comparison, no judgement (a pod running N jobs at once is not slow for it)."""
+    by_pod = {}
+    for pace, other_load, pod_id, measured_s in others.values():
+        if other_load == load and now - measured_s <= REFERENCE_MAX_AGE_SECONDS:
+            by_pod.setdefault(pod_id, []).append(pace)
+    if len(by_pod) < MIN_REFERENCE_PODS:
+        return None
+    return median([median(paces) for paces in by_pod.values()]), len(by_pod)
+
+
+def median(values):
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def worth_moving(seconds_left_here, slowness, boot_seconds):
+    """Is moving a job off a slow pod worth a new pod's boot (pure)? What it saves -- its seconds left on this pod x
+    (1 - 1/slowness) -- must exceed boot_seconds: a job near its end runs on where it is."""
+    return seconds_left_here * (1 - 1 / slowness) > boot_seconds
+
+
+def seconds_left_here(running, slowness, now):
+    """A running job's seconds left on its pod: its units left x its measured rate, else (not measured yet) its
+    expected_s x the pod's slowness less what it has run."""
+    rate = seconds_per_unit(running.observations)
+    if rate is not None and running.total:
+        return (running.total - running.done) * rate
+    return max(running.job["expected_s"] * slowness - (now - running.started_s), 0.0)
 
 
 def should_requeue(job, stopped_for, progressed):
@@ -940,11 +982,14 @@ class Running:
 
 
 class StockWait:
-    """A requirement set RunPod could not give a pod: since when, how many attempts missed in a row, when the next
-    create may go, the last attempt counted, and every miss (the story its jobs FAIL with past the max wait)."""
+    """A requirement set RunPod could not give a pod: since when, since when it has had NO pod (None while a pod
+    serves it: the max wait's clock, Pool.fail_the_jobs_that_waited_too_long_for_stock), how many attempts missed in a
+    row, when the next create may go, the last attempt counted, and every miss (the story its jobs FAIL with past the
+    max wait)."""
 
     def __init__(self, first_miss_s):
-        self.first_miss_s, self.misses, self.retry_at_s, self.counted_attempt, self.story = first_miss_s, 0, 0.0, -1, []
+        self.first_miss_s, self.podless_since_s = first_miss_s, first_miss_s
+        self.misses, self.retry_at_s, self.counted_attempt, self.story = 0, 0.0, -1, []
 
 
 class Pool:
@@ -956,8 +1001,9 @@ class Pool:
         self.mismatched = {}               # requirement key -> reason: a pod opened for it did not satisfy it
         self.missing_queues_said = set()
         self.last_status = None
-        self.rates_by_command = {}         # command -> {attempt key: seconds per unit}: the reference of judge_speeds
-        self.slow_datacenters = read_slow_datacenters()   # datacenter -> {until_unix, until, why, pod}
+        self.paces_by_command = {}         # command -> {attempt key: (pace, load, pod id, measured at)}: judge_speeds
+        self.slow_datacenters = read_slow_datacenters()   # kind -> datacenter -> {until_unix, until, why, pod}
+        self.slow_kept_said = set()        # pods measured slow but kept (their set is short of stock): said once
         self.last_capacity = None          # the capacity of the last GPU pod podd read: a booting GPU pod's guess
         self.offers = None                 # (time, pod.sh avail's JSON) of the cards the config lists
         self.cpu_offers = None             # (time, pod.sh avail-cpu's JSON) of the config's cpu_flavors
@@ -993,6 +1039,7 @@ class Pool:
         job on every other pod (2026-10-15: one HTTP 500 "unexpected end of JSON input" on a DELETE stopped podd, failed
         two running jobs and left two pods billing)."""
         self.pods.pop(pod.name, None)
+        self.slow_kept_said.discard(pod.name)
         try:
             pod.delete(reason)
         except PodError as error:
@@ -1007,14 +1054,16 @@ class Pool:
             del self.undeleted[name]
             self.forget(pod, f"retrying the failed delete ({reason})")
 
-    def avoided_datacenters(self):
-        """The datacenters a slow pod was in within SLOW_DATACENTER_HOURS (the expired ones are said and dropped)."""
-        for datacenter, record in list(self.slow_datacenters.items()):
+    def avoided_datacenters(self, kind):
+        """The datacenters a slow pod of this kind was in within SLOW_DATACENTER_HOURS (the expired ones are said and
+        dropped). A CPU host's slowness says nothing of a GPU host's in the same datacenter, and the reverse."""
+        recorded = self.slow_datacenters.get(kind, {})
+        for datacenter, record in list(recorded.items()):
             if record["until_unix"] <= time.time():
-                del self.slow_datacenters[datacenter]
-                say(f"{datacenter}: no longer avoided (slow until {record['until']}: {record['why']})")
+                del recorded[datacenter]
+                say(f"{datacenter}: no longer avoided for {kind} pods (slow until {record['until']}: {record['why']})")
                 write_slow_datacenters(self.slow_datacenters)
-        return sorted(self.slow_datacenters)
+        return sorted(recorded)
 
     def count_loads(self):
         """Every running job's load: how many jobs its pod runs now, and the most during it (its deadline's factor)."""
@@ -1023,62 +1072,92 @@ class Pool:
             running.peak_load = max(running.peak_load, running.load)
 
     def judge_speeds(self):
-        """SLOW HOSTS. Every running job with a measured rate (seconds_per_unit) against the reference at the same
-        load (reference_seconds_per_unit: the load of a rate is the most jobs its pod ran over the units measured); at
-        SLOW_FACTOR or more its pod is SLOW (mark_slow). No reference at its load: no judgement. A pod's slowness,
-        what its jobs' deadlines scale by, is the largest its jobs measured."""
+        """SLOW HOSTS. Every running job with a measured rate (seconds_per_unit) has a pace (pace_of: over its own
+        expected seconds per unit), judged against the median pace of other pods at the same load (reference_pace: the
+        load of a rate is the most jobs its pod ran over the units measured); at SLOW_FACTOR or more its pod is SLOW
+        (mark_slow) -- unless its set is short of stock: nothing would replace it, so it is kept and said. A job with no
+        reference is not judged; alone on its pod its slowness is its pace (expected_s's word, never a judgement). A
+        pod's slowness, what its jobs' deadlines scale by, is the largest its jobs measured."""
+        now = time.time()
+        for paces in self.paces_by_command.values():         # too old to be a reference: forgotten
+            for key in [key for key, measured in paces.items() if now - measured[3] > REFERENCE_MAX_AGE_SECONDS]:
+                del paces[key]
         for running in list(self.running.values()):
             rate = seconds_per_unit(running.observations)
             if rate is None:
                 continue
             load = max(observation[2] for observation in running.observations)
-            rates = self.rates_by_command.setdefault(running.job["command"], {})
-            rates[running.key] = (rate, load)
-            found = reference_seconds_per_unit(running.job, running.total, load,
-                                               [measured for key, measured in rates.items() if key != running.key])
+            pace = pace_of(rate, running.job, running.total)
+            pod = self.pods.get(running.pod_name)
+            pod_id = ((pod.facts if pod else None) or {}).get("pod_id") or running.pod_name
+            paces = self.paces_by_command.setdefault(running.job["command"], {})
+            paces[running.key] = (pace, load, pod_id, now)
+            found = reference_pace(load, {key: measured for key, measured in paces.items() if measured[2] != pod_id},
+                                   now)
             running.rate = round(rate, 2)
             if found is None:
+                if load == 1:
+                    running.slowness = round(pace, 2)
+                    if pod is not None:
+                        pod.slowness = max(pod.slowness, running.slowness)
                 continue
-            reference, source = found
-            running.slowness = round(rate / reference, 2)
-            pod = self.pods.get(running.pod_name)
+            reference, pods_measured = found
+            running.slowness = round(pace / reference, 2)
             if pod is None:
                 continue
             pod.slowness = max(pod.slowness, running.slowness)
-            if running.slowness >= SLOW_FACTOR and pod.state == "ready":
-                self.mark_slow(pod, running, f"{running.job.get('label') or running.key} does {rate:.1f} s a unit "
-                                            f"({running.progress_text()}), {running.slowness:.2f}x {reference:.1f} s "
-                                            f"({source}) >= SLOW_FACTOR {SLOW_FACTOR}")
+            if running.slowness < SLOW_FACTOR or pod.state != "ready":
+                continue
+            why = (f"{running.job.get('label') or running.key} does {rate:.1f} s a unit ({running.progress_text()}), "
+                   f"pace {pace:.2f} of its expected_s, {running.slowness:.2f}x the median pace {reference:.2f} of "
+                   f"{pods_measured} other pods running the same command, {load} job(s) at once >= SLOW_FACTOR "
+                   f"{SLOW_FACTOR}")
+            key = requirement_key(pod.requires)
+            if key in self.short_of_stock:
+                if pod.name not in self.slow_kept_said:
+                    self.slow_kept_said.add(pod.name)
+                    say(f"(・_・;) {pod.name} is slow ({why}), but RunPod has no stock to replace it: it is KEPT, its "
+                        f"jobs' deadlines scaled by {pod.slowness:.2f}")
+                continue
+            self.mark_slow(pod, why)
 
-    def mark_slow(self, pod, judged, why):
+    def mark_slow(self, pod, why):
         """A SLOW pod: it takes no more jobs and goes once empty (the opening rule replaces it: a slow pod serves no
-        set); its resumable jobs are stopped (pulled home and requeued: run_the_job), each at most MAX_SLOW_STOPS times;
-        the others run on under a deadline scaled by its slowness. Its datacenter is avoided for
-        SLOW_DATACENTER_HOURS. All said loudly."""
+        set); its resumable jobs are stopped (pulled home and requeued: run_the_job) when the move is worth a boot
+        (worth_moving), each at most MAX_SLOW_STOPS times; the others run on under a deadline scaled by its slowness.
+        Its datacenter is avoided by creates of its kind for SLOW_DATACENTER_HOURS. All said loudly."""
         pod.state, pod.problem = "slow", f"SLOW: {why}"
-        datacenter = (pod.facts or {}).get("datacenter")
+        self.slow_kept_said.discard(pod.name)
+        datacenter, kind = (pod.facts or {}).get("datacenter"), pod_kind(pod.requires)
         say(f"(╯°□°)╯ {pod.name} ({datacenter}, {(pod.facts or {}).get('gpu') or 'CPU'}) IS SLOW: {why}. It takes no "
             f"more jobs and goes once empty")
         if datacenter:
             until_unix = time.time() + SLOW_DATACENTER_HOURS * 3600
-            self.slow_datacenters[datacenter] = {
+            self.slow_datacenters.setdefault(kind, {})[datacenter] = {
                 "until_unix": until_unix, "pod": pod.name, "why": why,
                 "until": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(until_unix))}
             write_slow_datacenters(self.slow_datacenters)
-            say(f"(╯°□°)╯ {datacenter} is recorded SLOW: podd's creates avoid it for {SLOW_DATACENTER_HOURS} h "
-                f"({SLOW_DATACENTERS_FILE})")
+            say(f"(╯°□°)╯ {datacenter} is recorded SLOW for {kind} pods: podd's {kind} creates avoid it for "
+                f"{SLOW_DATACENTER_HOURS} h, unless RunPod has no stock elsewhere ({SLOW_DATACENTERS_FILE})")
         else:
             say(f"(╯°□°)╯ {pod.name}: pod.sh recorded no datacenter for it, so podd cannot avoid where it was")
         for running in self.jobs_on(pod.name):
             label = running.job.get("label") or running.key
             moved = sum(1 for attempt in running.job.get("attempts") or [] if attempt.get("stopped_for") == "slow pod")
-            if running.job.get("resumable") and moved < MAX_SLOW_STOPS:
+            if not running.job.get("resumable"):
+                why_not = "not resumable"
+            elif moved >= MAX_SLOW_STOPS:
+                why_not = f"moved off slow pods {moved} times already: its expected_s may be optimistic"
+            elif not worth_moving(seconds_left_here(running, max(pod.slowness, 1.0), time.time()),
+                                  max(pod.slowness, 1.0), self.config["boot_seconds"]):
+                why_not = (f"{running.progress_text()} done: moving it saves less than a boot "
+                           f"(boot_seconds {self.config['boot_seconds']})")
+            else:
                 running.stop = ("slow pod", f"its pod {pod.name} is slow ({why})")
                 say(f"{label}: stopping it on slow {pod.name}: what it finished comes home and it is requeued")
-            else:
-                say(f"(・_・;) {label}: runs on, on slow {pod.name} ("
-                    f"{'not resumable' if not running.job.get('resumable') else f'moved off slow pods {moved} times already: its expected_s may be optimistic'}"
-                    f"); its deadline is now {job_deadline_s(running.job, pod.slowness, running.peak_load):.0f} s")
+                continue
+            say(f"(・_・;) {label}: runs on, on slow {pod.name} ({why_not}); its deadline is now "
+                f"{job_deadline_s(running.job, pod.slowness, running.peak_load):.0f} s")
 
     def fail_waiting(self, waiting, key, reason):
         for stage, job in [(stage, job) for stage, job in waiting if requirement_key(job["requires"]) == key]:
@@ -1173,17 +1252,35 @@ class Pool:
             f"max_wait_for_stock_minutes {self.config['max_wait_for_stock_minutes']})")
 
     def fail_the_jobs_that_waited_too_long_for_stock(self, waiting):
-        """A set short of stock past max_wait_for_stock_minutes: its waiting jobs FAIL with every miss; a set with no
-        job waiting any more forgets its wait."""
+        """A set short of stock that has had NO pod for max_wait_for_stock_minutes: its waiting jobs FAIL with every
+        miss. While a pod serves it (ready or slow, its facts satisfying the set) or a job of it runs, its jobs wait
+        and the clock is reset (2026-10-22: 20 jobs FAILED "no pod for 60 min" while 3 pods of their set ran other
+        chunks). A set with no job waiting any more forgets its wait."""
         waiting_keys = {requirement_key(job["requires"]) for _, job in waiting}
         for key, wait in list(self.short_of_stock.items()):
             if key not in waiting_keys:
                 del self.short_of_stock[key]
-            elif time.time() - wait.first_miss_s > self.config["max_wait_for_stock_minutes"] * 60:
+                continue
+            if self.has_a_pod(key):
+                wait.podless_since_s = None
+                continue
+            if wait.podless_since_s is None:
+                wait.podless_since_s = time.time()
+                say(f"(╯°□°)╯ {key}: short of stock and now with no pod: its jobs FAIL in "
+                    f"{self.config['max_wait_for_stock_minutes']} min (max_wait_for_stock_minutes) unless RunPod "
+                    f"gives it one")
+            if time.time() - wait.podless_since_s > self.config["max_wait_for_stock_minutes"] * 60:
                 del self.short_of_stock[key]
                 self.fail_waiting(waiting, key, f"no pod for {self.config['max_wait_for_stock_minutes']} min "
                                                 f"(max_wait_for_stock_minutes): RunPod gave its requires no pod in "
                                                 f"{wait.misses} attempts:\n  - " + "\n  - ".join(wait.story))
+
+    def has_a_pod(self, key):
+        """Does a pod serve this set now: a job of it running, or a ready or slow pod whose facts satisfy it?"""
+        requires = json.loads(key)
+        return (any(requirement_key(running.job["requires"]) == key for running in self.running.values())
+                or any(pod.state in ("ready", "slow") and pod.facts and not unmet_requirements(requires, pod.facts)
+                       for pod in self.pods.values()))
 
     def open_pods(self, unplaced, ready, waiting_keys):
         """THE OPENING RULE per requirement set with jobs waiting, oldest set first (pods_to_open)."""
@@ -1240,7 +1337,11 @@ class Pool:
                 f"pod(s) up or booting > boot_seconds {self.config['boot_seconds']}: opening {wanted}{staggered} "
                 f"(drain then {drain_seconds(backlog, serving + [(guess, True)] * wanted):.0f} s)")
             self.attempts[key] = self.attempts.get(key, 0) + 1
-            avoided = self.avoided_datacenters()
+            avoided = self.avoided_datacenters(kind)
+            if avoided and wait:                         # avoiding a slow datacenter must never cost a pod
+                say(f"(・_・;) {key} is short of stock: its create avoids no datacenter (not the slow ones "
+                    f"{', '.join(avoided)}): a slow pod is better than none")
+                avoided = []
             for _ in range(wanted):
                 pod = Pod(self.free_name(kind), self.secrets, requires, self.config, cards, self.attempts[key],
                           plan["vcpu"] if plan else None, avoided)
@@ -1349,7 +1450,14 @@ class Pool:
                                             "slowness": running.slowness, "load": running.load}
                                     for stage, running in self.running.items() if running.pod_name == pod.name}}
                       for pod in sorted(self.pods.values(), key=lambda pod: pod.name)],
-                  "slow_datacenters": self.slow_datacenters}
+                  "slow_datacenters": self.slow_datacenters,
+                  "short_of_stock": {key: {
+                      "misses": wait.misses, "since": utc_text(wait.first_miss_s),
+                      "no_pod_since": utc_text(wait.podless_since_s) if wait.podless_since_s is not None else None,
+                      "fails_at": (utc_text(wait.podless_since_s + self.config["max_wait_for_stock_minutes"] * 60)
+                                   if wait.podless_since_s is not None else None),
+                      "next_create_at": utc_text(wait.retry_at_s), "last": wait.story[-1][:300] if wait.story else None}
+                      for key, wait in self.short_of_stock.items()}}
         if status != self.last_status:
             STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
             job_contract.write_json_atomically(STATUS_FILE, {**status, "written_at": job_contract.utc_now_text()})
@@ -1378,8 +1486,13 @@ class Pool:
         self.write_status()
 
 
+def utc_text(unix_s):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(unix_s))
+
+
 def read_slow_datacenters(path=None):
-    """The slow datacenters podd recorded ({} when none); a file that is not that is said loudly and set aside."""
+    """The slow datacenters podd recorded per pod kind ({} when none); a file that is not that is said loudly and set
+    aside."""
     path = Path(path or SLOW_DATACENTERS_FILE)
     try:
         recorded = json.loads(path.read_text())
@@ -1389,10 +1502,12 @@ def read_slow_datacenters(path=None):
         say(f"(╯°□°)╯ {path} is not JSON ({error}): no datacenter is avoided; it is moved to {path}.broken")
         os.replace(path, path.with_name(path.name + ".broken"))
         return {}
-    if not (isinstance(recorded, dict) and all(isinstance(record, dict) and job_contract.is_number(record.get("until_unix"))
-                                               for record in recorded.values())):
-        say(f"(╯°□°)╯ {path} is not {{datacenter: {{until_unix, ...}}}}: no datacenter is avoided; it is moved to "
-            f"{path}.broken")
+    if not (isinstance(recorded, dict) and set(recorded) <= {"gpu", "cpu"}
+            and all(isinstance(datacenters, dict) and all(
+                isinstance(record, dict) and job_contract.is_number(record.get("until_unix"))
+                for record in datacenters.values()) for datacenters in recorded.values())):
+        say(f"(╯°□°)╯ {path} is not {{\"gpu\" | \"cpu\": {{datacenter: {{until_unix, ...}}}}}}: no datacenter is "
+            f"avoided; it is moved to {path}.broken")
         os.replace(path, path.with_name(path.name + ".broken"))
         return {}
     return recorded

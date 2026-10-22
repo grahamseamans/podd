@@ -28,7 +28,17 @@ def print_status():
                       f"unit, slowness {progress['slowness']}")
         if not status["pods"]:
             print("  (none)")
-        for datacenter, record in (status.get("slow_datacenters") or {}).items():
-            print(f"  avoided until {record['until']}: {datacenter} ({record['why']})")
+        for kind, datacenters in (status.get("slow_datacenters") or {}).items():
+            if not all(isinstance(record, dict) for record in (datacenters or {}).values()):
+                print(f"  avoided (not {{datacenter: record}}, printed as is): {kind} {datacenters}")
+                continue
+            for datacenter, record in (datacenters or {}).items():
+                print(f"  {kind} pods avoid until {record.get('until')}: {datacenter} ({record.get('why')})")
+        for key, wait in (status.get("short_of_stock") or {}).items():
+            print(f"  (╯°□°)╯ NO STOCK for {key}: {wait['misses']} miss(es) since {wait['since']}, next create at "
+                  f"{wait['next_create_at']}; " + (f"NO POD since {wait['no_pod_since']}: its jobs FAIL at "
+                                                    f"{wait['fails_at']}" if wait["no_pod_since"] else
+                                                    "its pods run its jobs: they wait, never fail") +
+                  f"\n      last: {wait['last']}")
     for stage, state, age_s in daemon.queue(job_contract.read_config()["queue_directories"]):
         print(f"{stage}  {state:<8} {age_s / 60:6.1f} min")
