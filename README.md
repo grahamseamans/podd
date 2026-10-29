@@ -60,14 +60,15 @@ pod.sh, no ssh, no rsync.
   the driver on the pod (`cuda_version`) and deletes a pod below this at once, loudly, avoids its datacenter for GPU
   pods for `OLD_DRIVER_DATACENTER_HOURS` (even while short of stock: such a pod runs nothing), and counts it as a
   stock miss (the jobs stay JOB). An image that refuses the driver at container start (`NVIDIA_REQUIRE_CUDA`) never
-  opens ssh: `pod.sh create` gives up after 15 min, a boot failure. The old key `allowed_cuda_versions` is refused by
+  opens ssh: `pod.sh create` gives up after 15 min, a boot failure (a miss, like stock). The old key `allowed_cuda_versions` is refused by
   name.
 - `cpu_flavors`: the RunPod CPU flavors a CPU pod may be (`pod.sh avail-cpu`: $/vCPU-h and RAM per vCPU from the REST
   v2 catalog).
 - `boot_seconds` (default 150, the measured 97-155 s): podd opens another pod only while the backlog would take
   longer than this to drain on the pods up or booting.
-- `max_wait_for_stock_minutes` (default 60): RunPod refusing a create for stock ("no instances currently available")
-  is waited out, never a failure: the jobs stay JOB and podd retries one pod after 60 s, doubling to 10 min, avoiding
+- `max_wait_for_stock_minutes` (default 60): RunPod refusing a create for stock ("no instances currently available"),
+  and a pod that did not boot (`pod.sh create` failed, or podd could not read the pod), is waited out, never a failure
+  on its own: the jobs stay JOB and podd retries one pod after 60 s, doubling to 10 min, avoiding
   no slow datacenter (an old driver's still: such a pod runs nothing). While a pod of the set runs, its jobs wait for it however long; a set with NO
   pod for this long FAILS its jobs with every miss. `podd status` shows each wait and when it would fail.
 

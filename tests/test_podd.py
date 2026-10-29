@@ -11,7 +11,8 @@ its outputs home and a resumable one is requeued to do the rest, a pod much slow
 replaced and its datacenter avoided (never while its set is short of stock), a GPU pod's driver CUDA version is read
 from nvidia-smi and one below min_cuda_version is deleted with its jobs kept queued and its datacenter avoided (even
 short of stock), a GPU create sends no allowedCudaVersions, a set short of stock fails only after
-max_wait_for_stock_minutes with no pod, the deadline
+max_wait_for_stock_minutes with no pod, a pod that did not boot is a miss of that same wait (its set's jobs stay queued,
+a create follows the backoff) while a job no pod can hold still fails at once, the deadline
 scales with expected_s and the pod's slowness, and podd imports nothing but the standard library.
 
     PYTHONPATH=src /usr/bin/python3 tests/test_podd.py      (from the repo root; or with podd installed)
@@ -438,7 +439,7 @@ def test_no_instances_leaves_the_jobs_queued_and_retries_one_pod_with_every_card
             assert pool.short_of_stock, "2026-10-15: a pod made BEFORE the miss does not end the wait"
             del pool.pods["podd-g8"]
             (pool.secrets / podd.PODS_DIRECTORY_NAME / "podd-g8.id").unlink()
-            assert not pool.pods and said.getvalue().count("NO STOCK") == 1, "four misses of one attempt: said once"
+            assert not pool.pods and said.getvalue().count("NO POD") == 1, "four misses of one attempt: said once"
             assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
             wait = next(iter(pool.short_of_stock.values()))
             assert wait.misses == 1 and 55 < wait.retry_at_s - time.time() <= 60, wait.retry_at_s - time.time()
@@ -573,6 +574,86 @@ def test_pod_sh_create_exiting_75_is_a_stock_miss_with_runpods_answer_not_a_boot
     assert pod.state == "no stock" and "no instances currently available" in pod.problem, (pod.state, pod.problem)
     assert "exit 75" in (PACKAGE_DIRECTORY / "pod.sh").read_text() and '*"no instances"*' in \
         (PACKAGE_DIRECTORY / "pod.sh").read_text(), "pod.sh maps RunPod's no-instances answer to exit 75"
+
+
+def did_not_boot(pool):
+    for pod in pool.pods.values():
+        pod.state, pod.problem = "boot failed", ("PodError: pod.sh create podd-g1 exited 1: no public ssh port after "
+                                                 "15 min")
+
+
+def test_a_pod_that_did_not_boot_is_a_miss_its_set_waits_retries_after_the_backoff_and_fails_only_past_max_wait():
+    """2026-10-29 16:42: podd-g1 did not boot (no public ssh port after 15 min); a pause of its own FAILED the set's
+    jobs, and a job of that set queued 28 s later, with no create of its own. Now a boot failure is a miss, like a
+    stock miss: one wait, one backoff, one give-up (max_wait_for_stock_minutes, with every miss)."""
+    root = Path(tempfile.mkdtemp(prefix="podd-boot-"))
+    pool, queue_directory = stock_pool(root, jobs=2)
+    saved = podd.Pod, podd.STATUS_FILE
+    podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            pool.step()
+            assert pool.pods, said.getvalue()
+            did_not_boot(pool)
+            pool.step()
+            assert not pool.pods and "did not boot" in said.getvalue(), said.getvalue()[-600:]
+            assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir()), \
+                "a boot failure leaves its set's jobs queued"
+            wait = next(iter(pool.short_of_stock.values()))
+            assert wait.misses == 1 and 55 < wait.retry_at_s - time.time() <= 60, "the stock backoff, no pause of its own"
+            during = queue_directory / "queued-during-the-pause"            # 16:42:41, inside the pause
+            during.mkdir()
+            (during / "in").write_text("x")
+            podjobs.write_job(during, a_job(cpu="all", expected_s=75))
+            pool.step()
+            assert podjobs.stage_state(during) == podjobs.JOB, (during / podjobs.FAILED).read_text() \
+                if (during / podjobs.FAILED).exists() else "?"
+            assert not pool.pods, "backing off: no create before retry_at"
+            wait.retry_at_s = 0                                              # the backoff has passed
+            pool.step()
+            assert len(pool.pods) == 1, ("after the backoff: one create, a probe", said.getvalue()[-600:])
+            did_not_boot(pool)
+            pool.step()
+            assert wait.misses == 2 and 115 < wait.retry_at_s - time.time() <= 120, "the backoff doubles"
+            assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
+            wait.podless_since_s -= 61 * 60
+            pool.step()
+    finally:
+        podd.Pod, podd.STATUS_FILE = saved
+    for stage in queue_directory.iterdir():
+        assert podjobs.stage_state(stage) == podjobs.FAILED, stage
+        reason = (stage / podjobs.FAILED).read_text()
+        assert "max_wait_for_stock_minutes" in reason and reason.count("no public ssh port after 15 min") == 2, reason
+        assert "2 attempts" in reason, reason
+    assert not pool.short_of_stock
+
+
+def test_a_job_no_pod_can_hold_still_fails_at_once_while_another_set_waits_after_a_boot_failure():
+    root = Path(tempfile.mkdtemp(prefix="podd-boot-"))
+    pool, queue_directory = stock_pool(root, jobs=1)
+    saved = podd.Pod, podd.STATUS_FILE
+    podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            pool.step()
+            did_not_boot(pool)
+            pool.step()
+            assert pool.short_of_stock and not pool.pods, said.getvalue()[-600:]
+            serving_b = podd.Pod("podd-g8", pool.secrets, {"image": IMAGE_B}, pool.config, attempt=0)
+            serving_b.created, serving_b.state = True, "ready"
+            serving_b.facts = dict(FACTS_A, pod_name="podd-g8", image=IMAGE_B)
+            pool.pods["podd-g8"] = serving_b
+            (pool.secrets / podd.PODS_DIRECTORY_NAME / "podd-g8.id").write_text("pod-a\n")
+            too_big = queue_directory / "too-big"
+            too_big.mkdir()
+            (too_big / "in").write_text("x")
+            podjobs.write_job(too_big, a_job(cpu=100, requires={"image": IMAGE_B}))
+            pool.step()
+    finally:
+        podd.Pod, podd.STATUS_FILE = saved
+    assert podjobs.stage_state(too_big) == podjobs.FAILED, "a job no pod size can hold fails at once"
+    assert "no pod of its requires can hold it" in (too_big / podjobs.FAILED).read_text()
+    assert podjobs.stage_state(queue_directory / "twin-0") == podjobs.JOB, "the boot-failed set still waits"
 
 
 # 5. A POD'S FACTS, from what it printed

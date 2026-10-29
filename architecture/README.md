@@ -78,6 +78,12 @@ THE PATTERN.
   in the status file) and retries one pod after 60 s doubling to 10 min, avoiding no slow datacenter, and only a set with
   NO pod for max_wait_for_stock_minutes FAILS, with every miss: the clock runs only while no pod serves the set
   (2026-10-22: 20 jobs FAILED while 3 pods of their set ran).
+- A pod that did not boot is a miss of that same wait, not a failure of its own (2026-10-29: pod.sh create exited 1,
+  "no public ssh port after 15 min"; a separate 300 s pause FAILED the set's jobs, and a job queued 28 s later, with
+  no create of its own): deleted, said, the set's jobs stay JOB, the next create backs off, and the set FAILS only by
+  the stock rule, the boot failure's reason in its list of misses. One wait (StockWait) for every way a set gets no
+  pod: no stock, no card under the cap, an old driver, no boot. A job no pod can ever run (no pod size holds it, a pod
+  opened for its set did not satisfy it) still FAILS at once.
 - Nothing fails quietly: every failure is a FAILED file (and the journal for podd's); a stage that failed stays until
   a person reads it and deletes it by name. A failure on one pod fails only its jobs; a pod whose ssh or rsync failed
   is BROKEN: it takes no more jobs and is deleted once empty. A job's own failure (non-zero exit, a missing output) is
@@ -104,7 +110,7 @@ THE PATTERN.
   min_cuda_version (integer tuples: 13.10 > 13.2) is deleted at once, its datacenter avoided by GPU creates (even short
   of stock: unlike a slow pod it runs nothing), and its set takes it as a stock miss (jobs stay JOB, bounded by
   max_wait_for_stock_minutes). An image that refuses the driver at container start never opens ssh: pod.sh create's
-  15 min wait, then a boot failure.
+  15 min wait, then a boot failure (a miss, above).
 - A failed pod delete is said loudly and retried every minute, never podd's end (2026-10-15: one RunPod HTTP 500 on
   a DELETE stopped podd, failing two running jobs on other pods and leaving two pods billing).
 - Pods never outlive their work: idle -> deleted, podd stopped -> deleted (a booting create is stopped first), podd

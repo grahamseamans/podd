@@ -36,7 +36,7 @@ def print_status():
                 print(f"  {kind} pods avoid until {record.get('until')}: {datacenter} ({record.get('because')}: "
                       f"{record.get('why')})")
         for key, wait in (status.get("short_of_stock") or {}).items():
-            print(f"  (╯°□°)╯ NO STOCK for {key}: {wait['misses']} miss(es) since {wait['since']}, next create at "
+            print(f"  (╯°□°)╯ NO POD for {key}: {wait['misses']} miss(es) since {wait['since']}, next create at "
                   f"{wait['next_create_at']}; " + (f"NO POD since {wait['no_pod_since']}: its jobs FAIL at "
                                                     f"{wait['fails_at']}" if wait["no_pod_since"] else
                                                     "its pods run its jobs: they wait, never fail") +

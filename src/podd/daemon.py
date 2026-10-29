@@ -53,7 +53,9 @@ first, cheapest first. A booting CPU pod's capacity is that plan. Facts, packing
 SHORT OF STOCK IS NOT A FAILURE. pod.sh create exits POD_SH_NO_STOCK_EXIT when RunPod has no instance of any card
 offered; podd says so loudly once per attempt, the set's jobs stay JOB, and its next create waits
 stock_backoff_seconds (60 s doubling to 10 min) and is ONE pod (a probe, not a burst), avoiding no slow datacenter,
-until a create succeeds. No card under the cap counts the same way, and so does a pod on an old driver. A set short
+until a create succeeds. No card under the cap counts the same way, and so does a pod on an old driver, and so does a
+pod that did not boot (2026-10-29: pod.sh create exited 1, "no public ssh port after 15 min"; a pause of its own
+FAILED the set's jobs, and a job queued during it, with no create of its own): ONE wait, StockWait. A set short
 of stock that has had NO pod (none ready or
 slow serving it, no job of it running) for more than max_wait_for_stock_minutes FAILS its waiting jobs with every miss
 (time, cards offered, RunPod's answer); while a pod serves it, they wait. The waits are in the status file. A pod whose facts do not
@@ -72,7 +74,7 @@ is deleted at once, its datacenter avoided by GPU creates for OLD_DRIVER_DATACEN
 of stock (an old-driver pod runs nothing, unlike a slow one), and the miss counts as a stock miss: the jobs stay JOB,
 the next create backs off, and a set with no pod for max_wait_for_stock_minutes FAILS (Pool.reject_old_driver).
 An image that refuses the old driver at container start (NVIDIA_REQUIRE_CUDA: "OCI runtime create failed") never
-opens ssh: pod.sh create gives up after 15 min and exits 1, which is a boot failure like any other. Ready: takes jobs.
+opens ssh: pod.sh create gives up after 15 min and exits 1, which is a boot failure like any other (a miss). Ready: takes jobs.
 SLOW or BROKEN: takes no more, deleted once empty. Deleted
 after idle_minutes with no job, when a job on it failed for a reason of the pod's own (ssh, rsync: it is BROKEN), once
 SLOW and empty, or when podd stops (a booting create is stopped, its pod deleted). pod.sh's watchdog
@@ -109,8 +111,10 @@ MAX_SLOW_STOPS times), its others run on under the scaled deadline, and its data
 under its kind: that kind's creates avoid it for SLOW_DATACENTER_HOURS. A pod's slowness (the largest its jobs
 measured) scales its jobs' deadlines. All said loudly.
 
-NOTHING FAILS QUIETLY. A create that fails for anything but stock is said, and that set's next create waits
-CREATE_RETRY_SECONDS; when nothing up or booting could serve the set, its waiting jobs FAIL with the reason. A broken JOB (job_contract.job_problems) FAILS with
+NOTHING FAILS QUIETLY. A pod that did not boot (pod.sh create failed, or podd could not ship podd-run.sh or read its
+facts) is said, deleted, and is a miss of its set like a stock miss: its jobs stay JOB until max_wait_for_stock_minutes
+with no pod, then FAIL with every miss. A job no pod can ever run (no pod size holds it, or a pod opened for its set
+did not satisfy it) FAILS at once. A broken JOB (job_contract.job_problems) FAILS with
 every problem. Only a resumable job is ever requeued, and only by podd (never a failed one).
 
 THE STATUS FILE: ~/.local/state/podd/PODS.json, rewritten whenever the pool changes (no secrets). `python3 -m podd status` prints
@@ -185,7 +189,6 @@ FIRST_GUESS_CAPACITY = {"cpu": 7.65, "ram_gb": 50.0}
 GPU_CONTAINER_DISK_GB = 30
 CPU_CONTAINER_DISK_GB = 20
 CPU_DISK_GB_PER_VCPU = 10
-CREATE_RETRY_SECONDS = 300           # after a failed pod.sh create, that set's next create waits this long
 POD_SH_NO_STOCK_EXIT = 75            # pod.sh create's exit when RunPod has no instance of any card offered (EX_TEMPFAIL)
 STOCK_RETRY_FIRST_SECONDS = 60       # after a stock miss the set's next create waits this, doubling per miss in a row,
 STOCK_RETRY_MAX_SECONDS = 600        # at most this; the set's jobs stay JOB until max_wait_for_stock_minutes
@@ -1075,7 +1078,8 @@ class Running:
 
 
 class StockWait:
-    """A requirement set RunPod could not give a pod: since when, since when it has had NO pod (None while a pod
+    """A requirement set RunPod could not give a pod (no stock, no card under the cap, an old driver, a pod that did not
+    boot: Pool.stock_miss): since when, since when it has had NO pod (None while a pod
     serves it: the max wait's clock, Pool.fail_the_jobs_that_waited_too_long_for_stock), how many attempts missed in a
     row, when the next create may go, the last attempt counted, and every miss (the story its jobs FAIL with past the
     max wait)."""
@@ -1090,7 +1094,6 @@ class Pool:
         self.secrets, self.config = secrets, config
         self.pods = {}                     # name -> Pod (booting, ready, broken, ...)
         self.running = {}                  # stage path -> Running
-        self.failed_create = {}            # requirement key -> (time, reason)
         self.mismatched = {}               # requirement key -> reason: a pod opened for it did not satisfy it
         self.missing_queues_said = set()
         self.last_status = None
@@ -1349,7 +1352,8 @@ class Pool:
                             self.config["max_price_per_hour"], self.cpu_vcpu_ceiling.get(requirement_key(requires)))
 
     def stock_miss(self, key, attempt, why):
-        """RunPod gave the set no pod (its create was refused for stock, or no card is under the cap): the set's next
+        """RunPod gave the set no pod (its create was refused for stock, no card is under the cap, its pod landed on an
+        old driver, or its pod did not boot): the set's next
         create waits stock_backoff_seconds, its jobs stay JOB, and this is said loudly once per attempt (the creates
         of one attempt that all miss count once). attempt None: the miss was podd's own check, never a create."""
         wait = self.short_of_stock.setdefault(key, StockWait(time.time()))
@@ -1361,7 +1365,7 @@ class Pool:
         backoff_s = stock_backoff_seconds(wait.misses)
         wait.retry_at_s = time.time() + backoff_s
         wait.story.append(f"{job_contract.utc_now_text()} {why}")
-        say(f"(╯°□°)╯ NO STOCK for {key}: {why}. Its jobs stay queued; the next create (every card under the cap) in "
+        say(f"(╯°□°)╯ NO POD for {key}: {why}. Its jobs stay queued; the next create (every card under the cap) in "
             f"{backoff_s:.0f} s (miss {wait.misses} in a row, waiting {(time.time() - wait.first_miss_s) / 60:.1f} of "
             f"max_wait_for_stock_minutes {self.config['max_wait_for_stock_minutes']})")
 
@@ -1400,8 +1404,6 @@ class Pool:
         """THE OPENING RULE per requirement set with jobs waiting, oldest set first (pods_to_open)."""
         booting = [pod for pod in self.pods.values() if pod.state == "booting"]
         for key in waiting_keys:
-            if key in self.failed_create:
-                continue
             wait = self.short_of_stock.get(key)
             if wait and (time.time() < wait.retry_at_s
                          or any(requirement_key(pod.requires) == key for pod in booting)):
@@ -1446,7 +1448,7 @@ class Pool:
                 offered = ", ".join(f"{card} ${self.offers[1][card]['price_per_hour']}/h" for card in cards)
             staggered = ""
             if wait and wait.counted_attempt >= 0:       # RunPod refused the last create: one probe, not a burst
-                wanted, staggered = 1, " (one: RunPod refused the set's last create for stock)"
+                wanted, staggered = 1, " (one: the set's last create gave it no pod)"
             say(f"drain of {requirement_key(requires)}: {drain_seconds(backlog, serving):.0f} s on {len(serving)} "
                 f"pod(s) up or booting > boot_seconds {self.config['boot_seconds']}: opening {wanted}{staggered} "
                 f"(drain then {drain_seconds(backlog, serving + [(guess, True)] * wanted):.0f} s)")
@@ -1488,10 +1490,9 @@ class Pool:
                 self.stock_miss(key, pod.attempt, f"{pod.name} was offered {', '.join(pod.cards)}; {pod.problem}")
             elif pod.state == "boot failed":
                 self.pods.pop(pod.name)
-                self.failed_create[key] = (time.time(), pod.problem)
-                say(f"(╯°□°)╯ {pod.name} did not boot: {pod.problem}; that set's next create waits "
-                    f"{CREATE_RETRY_SECONDS} s")
+                say(f"(╯°□°)╯ {pod.name} did not boot: {pod.problem}; deleting it, its set's jobs stay queued")
                 self.forget(pod, "it failed its create or its read")
+                self.stock_miss(key, pod.attempt, f"{pod.name} did not boot: {pod.problem}")
             elif pod.state == "old driver":
                 self.pods.pop(pod.name)
                 self.reject_old_driver(pod)
@@ -1507,15 +1508,6 @@ class Pool:
         for key, reason in self.mismatched.items():
             self.fail_waiting(waiting, key, f"no pod can satisfy this job's requires: a pod opened for it did not "
                                             f"({reason})")
-        for key, (failed_s, reason) in list(self.failed_create.items()):
-            if time.time() - failed_s > CREATE_RETRY_SECONDS:
-                del self.failed_create[key]
-                continue
-            serving = [pod for pod in self.pods.values() if (pod.state == "booting" and requirement_key(
-                pod.requires) == key) or (pod.state == "ready" and not unmet_requirements(json.loads(key), pod.facts))]
-            if not serving:                              # nothing would run them: said, never left waiting
-                self.fail_waiting(waiting, key, f"no pod: the last pod.sh create for this job's requires failed "
-                                                f"({reason}) and no pod up or booting can run it")
         self.fail_the_jobs_that_waited_too_long_for_stock(waiting)
 
         ready = {name: pod for name, pod in self.pods.items() if pod.state == "ready"}
