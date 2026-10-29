@@ -70,7 +70,7 @@ pod.sh, no ssh, no rsync.
                                      "inputs": ["input.json", "solve.sh"],
                                      "outputs": ["result", "solve.log"],
                                      "requires": {"image": "ghcr.io/you/your-image:<sha>", "solver_version": 1,
-                                                  "gpu_memory_gb_min": 20},
+                                                  "gpu_memory_gb_min": 20, "disk_gb_min": 80},
                                      "cpu": 2.5, "gpu_memory_gb": 1, "ram_gb": 2.5, "expected_s": 55,
                                      "label": "..."}
     a job that can resume also:     "progress": "progress", "resumable": true,
@@ -84,8 +84,10 @@ stopped part-way, + a record in `attempts`).
   has stays. podd never deletes a file of the stage.
 
 - `requires.image` is what podd launches; `gpu` (`"any"`, a list of card names, or `"none"`: a CPU pod),
-  `gpu_memory_gb_min`, `cpu_min` are measured on the pod; every other key is matched against the facts the image
-  declares in `/etc/podd-facts.json` (below).
+  `gpu_memory_gb_min`, `cpu_min` are measured on the pod; `disk_gb_min` (decimal GB of container disk, optional) is
+  what podd creates the pod with when it is more than the default (30 GB on a GPU pod, 20 on a CPU pod; a CPU pod
+  gets 1 vCPU for every 10 GB, so a large disk makes it larger), matched against RunPod's `containerDiskInGb` for the
+  pod; every other key is matched against the facts the image declares in `/etc/podd-facts.json` (below).
 - `cpu` (cores, or `"all"`: the pod's whole quota, alone), `gpu_memory_gb`, `ram_gb`: what it uses, packed against
   what podd measured the pod has.
 - `expected_s` (required): its wall time ALONE on a FAST host. podd's drain estimate, and the deadline:
@@ -112,7 +114,7 @@ A CPU job (`requires.gpu: "none"`, `gpu_memory_gb` 0) runs on a CPU pod that pod
 An image podd can run starts sshd with RunPod's PUBLIC_KEY on its own (port 22), carries bash, awk, procps
 (ps / pkill / pgrep) and rsync, and declares its facts in `/etc/podd-facts.json` (a JSON object, e.g.
 `{"image_commit": "...", "solver_version": 1}`). podd measures `pod_name`, `pod_id`, `image`, `gpu`,
-`gpu_memory_gb`, `cpu`, `ram_gb`, `datacenter`, `cost_per_hr`, `ready_at` itself, so an image may not declare those.
+`gpu_memory_gb`, `cpu`, `ram_gb`, `disk_gb`, `datacenter`, `cost_per_hr`, `ready_at` itself, so an image may not declare those.
 A pod whose image declares no facts is refused. Nothing is installed on a pod: a pod from the image runs jobs as soon
 as ssh answers.
 
@@ -140,14 +142,14 @@ podd-c1 .. podd-c<max_pods.cpu>). The key comes from `$SECRETS` (`src/podd/secre
 `$SECRETS/runpod_pods/<name>.*`:
 
     pod.sh avail <cards>                 # JSON: each card's $/h and the datacenters stocking it now
-    pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> [<avoid datacenters>]   # podd's call
+    pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB> [<avoid datacenters>]   # podd's call
     pod.sh avail-cpu <flavors>           # JSON: each CPU flavor's $/vCPU-h, RAM/vCPU, vCPU range, stock
-    pod.sh create-cpu <name> <image> <flavors> <vCPU> [<avoid datacenters>]  # podd's call for a CPU pod
+    pod.sh create-cpu <name> <image> <flavors> <vCPU> <disk GB> [<avoid datacenters>]  # podd's call for a CPU pod
     pod.sh status <name> | delete <name> # delete prints the session's minutes and cost
     pod.sh recorded                      # the pods recorded here
     pod.sh account                       # every pod the RunPod account has: the leak check
 
-`create` passes `imageName`, `ports` 22/tcp, a 30 GB container disk, no volume, any datacenter (or, given ones to
+`create` passes `imageName`, `ports` 22/tcp, the container disk podd asks (30 GB unless a job requires more), no volume, any datacenter (or, given ones to
 avoid, `dataCenterIds` = pod.sh's `RUNPOD_DATACENTERS` less them), and no `PUBLIC_KEY` (RunPod injects the account's
 ssh keys). It writes the `runpod-<name>` block of `~/.ssh/config`: the key, `BatchMode`, `ConnectTimeout 10`,
 `ServerAliveInterval 15` x `ServerAliveCountMax 4` (a dropped connection fails in ~60 s instead of hanging) and

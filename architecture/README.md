@@ -49,7 +49,8 @@ THE PATTERN.
 - Standard library only, everywhere in `src/podd/` (a hard rule; `tests/test_podd.py` parses every module's imports).
   A client imports `podd.job_contract` and nothing else of podd.
 - Requirements are matched, never assumed: `requires.image` is launched, `gpu` / `gpu_memory_gb_min` / `cpu_min` are
-  measured on the pod, every other key is matched against the facts the IMAGE declares (/etc/podd-facts.json). A pod
+  measured on the pod, `disk_gb_min` is created (the container disk podd asks for) and matched against RunPod's
+  `containerDiskInGb` for the pod, every other key is matched against the facts the IMAGE declares (/etc/podd-facts.json). A pod
   without declared facts is refused; a pod opened for a set that turns out not to satisfy it is deleted and the set's
   jobs FAIL (no create loop). DONE says what was used; the client records it.
 - A client never talks to RunPod: no `pod.sh`, no ssh, no rsync. What it learns of a pod is DONE's `used`.

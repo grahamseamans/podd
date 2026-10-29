@@ -10,19 +10,21 @@
 # (secrets.sh, the one place) and keeps each pod's files in $SECRETS/runpod_pods/.
 #
 #   pod.sh avail <cards>         # JSON: each card's $/h and the datacenters stocking it now
-#   pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> [<avoid datacenters>]
+#   pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB> [<avoid datacenters>]
 #                                             # a pod of <image> on the first free card of <cards> (comma-separated,
 #                                             # in the order RunPod tries them), >= <min vCPU> per GPU, on a host whose
-#                                             # driver runs one of <cuda versions> (comma-separated), any datacenter
+#                                             # driver runs one of <cuda versions> (comma-separated), a container disk
+#                                             # of <disk GB> (whole GB; podd's container_disk_gb), any datacenter
 #                                             # but <avoid datacenters> (comma-separated: podd's slow ones);
 #                                             # save its id, arm its watchdog (deleted $MAX_POD_HOURS (default 2) after
 #                                             # its lease was last renewed: podd renews it while the pod has work), wait
 #                                             # for ssh, write its ssh alias. Exit 75 (EX_TEMPFAIL): RunPod has no
 #                                             # instance of any card offered now (a stock race, not an error: retry)
 #   pod.sh avail-cpu <flavors>   # JSON: each CPU flavor's $/vCPU-h, RAM per vCPU, vCPU range, stock
-#   pod.sh create-cpu <name> <image> <flavors> <vCPU> [<avoid datacenters>]
+#   pod.sh create-cpu <name> <image> <flavors> <vCPU> <disk GB> [<avoid datacenters>]
 #                                             # a CPU pod (no card) of <image>: the first free flavor of <flavors>
-#                                             # (comma-separated, in that order), exactly <vCPU> vCPUs; the rest as create
+#                                             # (comma-separated, in that order), exactly <vCPU> vCPUs, a container
+#                                             # disk of <disk GB>; the rest as create
 #   pod.sh ssh-config <name>     # (re)write the runpod-<name> block of ~/.ssh/config
 #   pod.sh id <name> | status <name> | delete <name>
 #   pod.sh recorded              # the names of every recorded pod (one per line)
@@ -64,6 +66,13 @@ rest() {  # rest <method> <path> [json-body]; fails loudly on any non-2xx, print
 # then not asked for: re-mirror the API and update this list).
 RUNPOD_DATACENTERS=EU-RO-1,CA-MTL-1,EU-SE-1,US-IL-1,EUR-IS-1,EU-CZ-1,US-TX-3,EUR-IS-2,US-KS-2,US-GA-2,US-WA-1,US-TX-1,CA-MTL-3,EU-NL-1,US-TX-4,US-CA-2,US-NC-1,OC-AU-1,US-DE-1,EUR-IS-3,CA-MTL-2,AP-JP-1,EUR-NO-1,EU-FR-1,US-KS-3,US-GA-1,AP-IN-1,US-MD-1,US-MO-1,US-MO-2
 
+# whole_gb <disk GB>: the container disk asked for, a positive whole number (RunPod's containerDiskInGb is an
+# integer), or a loud exit: never a default chosen here (podd's container_disk_gb is the one place)
+whole_gb() {
+  [[ $1 =~ ^[1-9][0-9]*$ ]] || { echo "pod.sh: (╯°□°)╯ the container disk must be a positive whole number of GB, got '$1'" >&2; exit 1; }
+  printf '%s' "$1"
+}
+
 # datacenters_json <avoid, comma-separated>: the dataCenterIds to send, as JSON ("null": none, any datacenter). An
 # avoided name RunPod does not list is said; avoiding every one is an error.
 datacenters_json() {
@@ -85,9 +94,9 @@ print(json.dumps(allowed))'
 field() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {}, {'d': d}))" "$1"; }
 
 # create_the_pod <name> <PodCreateInput JSON>: POST /pods, save the id, arm the watchdog, record price + RAM +
-# datacenter, wait for ssh, write the alias. GPU and CPU pods alike (create, create-cpu).
+# container disk + datacenter, wait for ssh, write the alias. GPU and CPU pods alike (create, create-cpu).
 create_the_pod() {
-  local body=$2 t0 created pod lease_s cost_per_hr machine datacenter memory_gb
+  local body=$2 t0 created pod lease_s cost_per_hr machine datacenter memory_gb container_disk_gb
   mkdir -p -m 700 $PODS_DIRECTORY
   [ ! -s $POD_ID_FILE ] || { echo "pod.sh: a pod named $NAME is recorded already: $(pod_id) (pod.sh delete $NAME first)" >&2; exit 1; }
   t0=$(date +%s)
@@ -118,7 +127,10 @@ create_the_pod() {
   # 540 GB, 2026-10-14), so this is the RAM podd packs against
   memory_gb=$(field 'd.get("memoryInGb") or ""' <<<"$created")
   [ -n "$memory_gb" ] || echo "pod.sh: (・_・;) the create response carries no memoryInGb: $created" >&2
-  COST=$cost_per_hr T0=$t0 DC=$datacenter MEMORY=$memory_gb python3 -c 'import json, os; print(json.dumps({"cost_per_hr": float(os.environ["COST"]) if os.environ["COST"] else None, "created_at_unix_s": int(os.environ["T0"]), "datacenter": os.environ["DC"] or None, "memory_gb": float(os.environ["MEMORY"]) if os.environ["MEMORY"] else None}))' > $POD_SESSION_FILE
+  # the pod's container disk as RunPod made it (Pod.containerDiskInGb): podd matches requires.disk_gb_min against it
+  container_disk_gb=$(field 'd.get("containerDiskInGb") or ""' <<<"$created")
+  [ -n "$container_disk_gb" ] || echo "pod.sh: (・_・;) the create response carries no containerDiskInGb: $created" >&2
+  COST=$cost_per_hr T0=$t0 DC=$datacenter MEMORY=$memory_gb DISK=$container_disk_gb python3 -c 'import json, os; print(json.dumps({"cost_per_hr": float(os.environ["COST"]) if os.environ["COST"] else None, "created_at_unix_s": int(os.environ["T0"]), "datacenter": os.environ["DC"] or None, "memory_gb": float(os.environ["MEMORY"]) if os.environ["MEMORY"] else None, "container_disk_gb": float(os.environ["DISK"]) if os.environ["DISK"] else None}))' > $POD_SESSION_FILE
   echo "pod $NAME ($pod) created in ${datacenter:-an unnamed datacenter} at \$$cost_per_hr/h; waiting for its ssh port"
   until rest GET /pods/$pod | field 'd.get("publicIp") and (d.get("portMappings") or {}).get("22") or ""' | grep -q .; do
     [ $(( $(date +%s) - t0 )) -lt 900 ] || { echo "pod $NAME ($pod): no public ssh port after 15 min" >&2; exit 1; }
@@ -197,23 +209,25 @@ print(json.dumps(offers, indent=1))'
   ;;
 create)
   name_the_pod "${2:-}"
-  IMAGE=${3:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions>}
-  CARDS=${4:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions>}
-  MIN_VCPU=${5:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions>}
-  CUDA_VERSIONS=${6:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions>}
-  DATACENTERS=$(datacenters_json "${7:-}")
+  IMAGE=${3:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB>}
+  CARDS=${4:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB>}
+  MIN_VCPU=${5:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB>}
+  CUDA_VERSIONS=${6:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB>}
+  DISK_GB=$(whole_gb "${7:-}")
+  DATACENTERS=$(datacenters_json "${8:-}")
   # PodCreateInput (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json): ports 22/tcp only (full ssh, no
-  # Jupyter); containerDiskInGb 30 (the image does not count against it: / showed 16 MB used with /opt at 5.7 GB,
+  # Jupyter); containerDiskInGb <disk GB>, podd's default 30 (daemon.py GPU_CONTAINER_DISK_GB; more when a job's
+  # requires.disk_gb_min asks: the image does not count against it: / showed 16 MB used with /opt at 5.7 GB,
   # 2026-10-04); volumeInGb 0 (no pod volume: results come home); env {}: no PUBLIC_KEY, so RunPod injects the
   # account's ssh keys ($SECRETS/runpod_ssh_ed25519.pub is one of them); no dockerEntrypoint/StartCmd: the image's.
   # allowedCudaVersions: the host driver must run the image's CUDA runtime. dataCenterIds only to avoid podd's slow
   # datacenters (RUNPOD_DATACENTERS less them); else none: any datacenter.
-  body=$(IMAGE=$IMAGE CARDS=$CARDS MIN_VCPU=$MIN_VCPU CUDA_VERSIONS=$CUDA_VERSIONS NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
+  body=$(IMAGE=$IMAGE CARDS=$CARDS MIN_VCPU=$MIN_VCPU CUDA_VERSIONS=$CUDA_VERSIONS DISK_GB=$DISK_GB NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
 import json, os
 body = {"name": os.environ["NAME"], "imageName": os.environ["IMAGE"], "cloudType": "SECURE",
     "gpuCount": 1, "gpuTypeIds": os.environ["CARDS"].split(","), "gpuTypePriority": "custom",
     "minVCPUPerGPU": int(os.environ["MIN_VCPU"]), "allowedCudaVersions": os.environ["CUDA_VERSIONS"].split(","),
-    "ports": ["22/tcp"], "containerDiskInGb": 30, "volumeInGb": 0, "volumeMountPath": "/workspace", "env": {},
+    "ports": ["22/tcp"], "containerDiskInGb": int(os.environ["DISK_GB"]), "volumeInGb": 0, "volumeMountPath": "/workspace", "env": {},
     "supportPublicIp": True}
 if json.loads(os.environ["DATACENTERS"]) is not None:
     body["dataCenterIds"] = json.loads(os.environ["DATACENTERS"])
@@ -222,20 +236,24 @@ print(json.dumps(body))')
   ;;
 create-cpu)
   name_the_pod "${2:-}"
-  IMAGE=${3:?pod.sh create-cpu <name> <image> <flavors> <vCPU>}
-  FLAVORS=${4:?pod.sh create-cpu <name> <image> <flavors> <vCPU>}
-  VCPU=${5:?pod.sh create-cpu <name> <image> <flavors> <vCPU>}
-  DATACENTERS=$(datacenters_json "${6:-}")
+  IMAGE=${3:?pod.sh create-cpu <name> <image> <flavors> <vCPU> <disk GB>}
+  FLAVORS=${4:?pod.sh create-cpu <name> <image> <flavors> <vCPU> <disk GB>}
+  VCPU=${5:?pod.sh create-cpu <name> <image> <flavors> <vCPU> <disk GB>}
+  DISK_GB=$(whole_gb "${6:-}")
+  DATACENTERS=$(datacenters_json "${7:-}")
   # PodCreateInput with computeType CPU (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json; the docs
   # mirror references/runpod/, tools/mirror_runpod_docs.sh): cpuFlavorIds in podd's order (cpuFlavorPriority
   # custom), vcpuCount (a power of two: api-reference-v2 BaseCpuConfig), the RAM is the flavor's per-vCPU multiple.
-  # containerDiskInGb 20: the CPU flavors cap the disk at 10 GB per vCPU (cpu3*: GraphQL cpuFlavors.diskLimitPerVcpu,
-  # 2026-10-15), so 20 fits every size from 2 vCPU; the image does not count against it. No CUDA, no card.
-  body=$(IMAGE=$IMAGE FLAVORS=$FLAVORS VCPU=$VCPU NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
+  # containerDiskInGb <disk GB>, podd's default 20 (daemon.py CPU_CONTAINER_DISK_GB): the CPU flavors cap the disk at
+  # 10 GB per vCPU (cpu3*: GraphQL cpuFlavors.diskLimitPerVcpu, 2026-10-15), so 20 fits every size from 2 vCPU, and a
+  # larger requires.disk_gb_min gets the vCPUs for it from podd's cpu_pod_plan (or no plan, said there, never a
+  # create RunPod refuses); the image does not count against it. No CUDA, no card.
+  body=$(IMAGE=$IMAGE FLAVORS=$FLAVORS VCPU=$VCPU DISK_GB=$DISK_GB NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
 import json, os
 body = {"name": os.environ["NAME"], "imageName": os.environ["IMAGE"], "cloudType": "SECURE",
     "computeType": "CPU", "cpuFlavorIds": os.environ["FLAVORS"].split(","), "cpuFlavorPriority": "custom",
-    "vcpuCount": int(os.environ["VCPU"]), "ports": ["22/tcp"], "containerDiskInGb": 20, "volumeInGb": 0,
+    "vcpuCount": int(os.environ["VCPU"]), "ports": ["22/tcp"], "containerDiskInGb": int(os.environ["DISK_GB"]),
+    "volumeInGb": 0,
     "volumeMountPath": "/workspace", "env": {}, "supportPublicIp": True}
 if json.loads(os.environ["DATACENTERS"]) is not None:
     body["dataCenterIds"] = json.loads(os.environ["DATACENTERS"])

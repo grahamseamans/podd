@@ -37,7 +37,7 @@ podd.SLOW_DATACENTERS_FILE = Path(tempfile.mkdtemp(prefix="podd-state-")) / "slo
 IMAGE_A = "ghcr.io/example/solver:" + "a" * 40
 IMAGE_B = "ghcr.io/example/solver:" + "b" * 40
 FACTS_A = {"pod_name": "podd-g1", "pod_id": "pod-a", "image": IMAGE_A, "image_commit": "a" * 40, "engine": "1.0",
-           "solver_version": 1, "gpu": "NVIDIA A40", "gpu_memory_gb": 48.3, "cpu": 7.65, "ram_gb": 50.0}
+           "solver_version": 1, "gpu": "NVIDIA A40", "gpu_memory_gb": 48.3, "cpu": 7.65, "ram_gb": 50.0, "disk_gb": 30.0}
 CARDS = [{"name": "NVIDIA RTX A4500", "memory_gb": 20}, {"name": "NVIDIA RTX A5000", "memory_gb": 24},
          {"name": "NVIDIA A40", "memory_gb": 48}]
 
@@ -68,14 +68,15 @@ def raises(exception, call, *words):
 def test_a_job_that_keeps_the_contract_has_no_problems_and_a_broken_one_lists_every_problem():
     assert podjobs.job_problems(a_job()) == []
     assert podjobs.job_problems(a_job(cpu="all", requires={"image": [IMAGE_A, IMAGE_B], "gpu": ["NVIDIA A40"],
-                                                             "gpu_memory_gb_min": 20, "cpu_min": 4})) == []
+                                                             "gpu_memory_gb_min": 20, "cpu_min": 4,
+                                                             "disk_gb_min": 80})) == []
     broken = {"command": "", "inputs": ["../outside", "/abs"], "outputs": ["DONE"], "cpu": 0, "gpu_memory_gb": -1,
               "ram_gb": "lots", "expected_s": 0, "slots": 1, "timeout_s": 0,
-              "requires": {"engine": "1.0", "gpu": "A40", "solver_version": []}, "colour": "red"}
+              "requires": {"engine": "1.0", "gpu": "A40", "solver_version": [], "disk_gb_min": 0}, "colour": "red"}
     problems = "\n".join(podjobs.job_problems(broken))
     for words in ("`command`", "'../outside'", "'/abs'", "'DONE' is a name podd keeps", "`cpu` 0 is neither",
                   "`gpu_memory_gb` -1", "`ram_gb` 'lots'", "`expected_s`", "unknown key `slots`",
-                  "`timeout_s`", "`requires.image`", "`requires.gpu`", "`requires.solver_version` is an empty list",
+                  "`timeout_s`", "`requires.image`", "`requires.gpu`", "`requires.solver_version` is an empty list", "`requires.disk_gb_min` must be a positive",
                   "unknown key `colour`"):
         assert words in problems, (words, problems)
 
@@ -129,9 +130,26 @@ def test_a_pod_satisfies_a_job_only_when_every_requirement_is_met():
                             ({"image": IMAGE_A, "flux": 1}, "declares no 'flux'"),
                             ({"image": IMAGE_A, "gpu": ["NVIDIA RTX A5000"]}, "gpu 'NVIDIA A40'"),
                             ({"image": IMAGE_A, "gpu_memory_gb_min": 80}, "gpu memory 48.3 GB < 80"),
-                            ({"image": IMAGE_A, "cpu_min": 8}, "cpu 7.65 < 8")):
+                            ({"image": IMAGE_A, "cpu_min": 8}, "cpu 7.65 < 8"),
+                            ({"image": IMAGE_A, "disk_gb_min": 80}, "container disk 30.0 GB < 80")):
         unmet = podd.unmet_requirements(requires, FACTS_A)
         assert len(unmet) == 1 and words in unmet[0], (requires, unmet)
+    assert podd.unmet_requirements({"image": IMAGE_A, "disk_gb_min": 30}, FACTS_A) == []
+    unknown_disk = {key: value for key, value in FACTS_A.items() if key != "disk_gb"}
+    assert podd.unmet_requirements({"image": IMAGE_A, "disk_gb_min": 1}, unknown_disk) == [
+        "container disk None GB < 1"], "a disk podd does not know never satisfies a disk requirement"
+
+
+def test_a_pod_is_created_with_the_container_disk_its_set_requires_and_never_less_than_the_default():
+    """2026-10-29: a training job decompresses a 46.3 GB dataset on the pod; the default 30 GB could not hold it."""
+    assert podd.container_disk_gb({"image": IMAGE_A}) == podd.GPU_CONTAINER_DISK_GB == 30
+    assert podd.container_disk_gb({"image": IMAGE_A, "disk_gb_min": 10}) == 30, "never less than the default"
+    assert podd.container_disk_gb({"image": IMAGE_A, "disk_gb_min": 79.2}) == 80, "whole GB, rounded up"
+    assert podd.container_disk_gb(CPU_REQUIRES) == podd.CPU_CONTAINER_DISK_GB == 20
+    assert podd.container_disk_gb({**CPU_REQUIRES, "disk_gb_min": 80}) == 80
+    pod = podd.Pod("podd-g1", Path(tempfile.mkdtemp(prefix="podd-disk-")), {"image": IMAGE_A, "disk_gb_min": 80},
+                   {"allowed_cuda_versions": ["12.8"]}, ["NVIDIA A40"], 1)
+    assert pod.create_command()[1:] == ["create", "podd-g1", IMAGE_A, "NVIDIA A40", "1", "12.8", "80"]
 
 
 def test_the_cards_asked_for_a_set_are_the_configs_order_filtered_by_name_and_memory():
@@ -250,6 +268,8 @@ def test_a_pod_booting_for_a_stricter_set_with_an_acceptable_image_serves_a_loos
     assert not podd.booting_pod_serves({"image": IMAGE_A}, strict, CARDS), "its engine is not known before it boots"
     assert not podd.booting_pod_serves(strict, {"image": IMAGE_B}, CARDS)
     assert not podd.booting_pod_serves(strict, dict(strict, gpu_memory_gb_min=40), CARDS)
+    assert not podd.booting_pod_serves(strict, dict(strict, disk_gb_min=80), CARDS), "it is made with 30 GB"
+    assert podd.booting_pod_serves(dict(strict, disk_gb_min=80), dict(strict, disk_gb_min=50), CARDS)
     assert not podd.booting_pod_serves(strict, {"image": IMAGE_A, "gpu": ["NVIDIA A40"]}, CARDS), "it may land on an A4500"
     assert podd.booting_pod_serves(dict(strict, gpu=["NVIDIA A40"]), {"image": IMAGE_A, "gpu": ["NVIDIA A40"]}, CARDS)
 
@@ -312,7 +332,7 @@ def test_a_job_requiring_an_image_no_running_pod_has_opens_a_pod_for_it():
     opened = [pod for name, pod in pool.pods.items() if name != "podd-g1"]
     assert len(opened) == 1 and opened[0].name == "podd-g2" and opened[0].started, (pool.pods, said.getvalue())
     assert opened[0].requires["image"] == IMAGE_B and opened[0].create_command()[3] == IMAGE_B
-    assert opened[0].create_command()[4:] == ["NVIDIA RTX A5000,NVIDIA A40,NVIDIA RTX A4500", "1", "12.8"], \
+    assert opened[0].create_command()[4:] == ["NVIDIA RTX A5000,NVIDIA A40,NVIDIA RTX A4500", "1", "12.8", "30"], \
         "every affordable card, in stock first, cheapest first"
     assert podjobs.stage_state(stage) == podjobs.JOB, "it waits for its pod; the running pod does not take it"
     assert "opening a pod for requirement set" in said.getvalue() and IMAGE_B in said.getvalue()
@@ -509,7 +529,7 @@ def test_a_set_short_of_stock_avoids_no_datacenter_and_a_cpu_ban_never_reaches_a
             probe = next(iter(pool.pods.values()))
     finally:
         podd.Pod, podd.STATUS_FILE = saved
-    assert probe.avoid_datacenters == [] and len(probe.create_command()) == 7, probe.create_command()
+    assert probe.avoid_datacenters == [] and len(probe.create_command()) == 8, probe.create_command()
     assert "avoids no datacenter" in said.getvalue(), said.getvalue()[-600:]
 
 
@@ -540,6 +560,9 @@ def test_a_pods_facts_are_read_from_what_it_prints():
     assert facts["gpu"] == "NVIDIA RTX A4500" and facts["gpu_memory_gb"] == 21.46 and facts["cpu"] == 7.65, facts
     assert facts["engine"] == "1.0" and facts["image"] == IMAGE_A and facts["cost_per_hr"] == 0.25
     assert facts["ram_gb"] == 53.69, "cgroup memory.max, decimal GB"
+    assert facts["disk_gb"] is None, "pod.sh recorded no container disk: unknown, never guessed"
+    assert podd.facts_of_pod("{}", "X, 1024", "max 100000\nnone\n12\n", "max\nMemTotal:  32000000 kB\n", IMAGE_A,
+                             {"container_disk_gb": 80.0}, "p", "i", "now")["disk_gb"] == 80.0, "RunPod's containerDiskInGb"
     unlimited = podd.facts_of_pod("{}", "X, 1024", "max 100000\nnone\n12\n", "max\nMemTotal:  32000000 kB\n", IMAGE_A, {},
                                   "p", "i", "now")
     assert unlimited["cpu"] == 12.0 and unlimited["ram_gb"] == 32.77, unlimited
@@ -790,6 +813,13 @@ def test_the_cpu_pod_is_sized_by_its_jobs_cheapest_per_job_under_the_cap():
     assert small["vcpu"] == 4 and small["jobs_per_pod"] == 2 and small["flavors"] == ["cpu3g"], small
     floor, _ = podd.cpu_pod_plan([a_cpu_job(cpu=8)], CPU_REQUIRES, ["cpu3c"], CPU_OFFERS, 0.60, vcpu_ceiling=2)
     assert floor["vcpu"] == 8, "a ceiling below one job's size is one job's size"
+    # a container disk needs its vCPUs (10 GB a vCPU): 80 GB is 8 vCPU for one 2-core job; 1000 GB fits no flavor
+    disk_requires = {**CPU_REQUIRES, "disk_gb_min": 80}
+    disk, why = podd.cpu_pod_plan([a_cpu_job(requires=disk_requires)], disk_requires, ["cpu3g"], CPU_OFFERS, 0.60)
+    assert why is None and disk["vcpu"] == 8 and disk["jobs_per_pod"] == 1, (disk, why)
+    huge_requires = {**CPU_REQUIRES, "disk_gb_min": 1000}
+    huge, why = podd.cpu_pod_plan([a_cpu_job(requires=huge_requires)], huge_requires, ["cpu3c"], CPU_OFFERS, 0.60)
+    assert huge is None and "PRICE CAP / SIZE" in why and '"disk_gb": 1000' in why and "needs 128 vCPU" in why, why
     none, why = podd.cpu_pod_plan([a_cpu_job()], CPU_REQUIRES, ["cpu3c", "cpu9x"], CPU_OFFERS, 0.05)
     assert none is None and "PRICE CAP" in why and "cpu9x: RunPod lists no price" in why, why
 
@@ -816,7 +846,7 @@ def test_a_set_requiring_no_card_opens_a_cpu_pod_through_create_cpu():
     finally:
         podd.Pod, podd.STATUS_FILE = saved
     assert sorted(pool.pods) == ["podd-c1", "podd-c2"], (list(pool.pods), said.getvalue())
-    assert pool.pods["podd-c1"].create_command()[1:] == ["create-cpu", "podd-c1", IMAGE_A, "cpu3g", "8"]
+    assert pool.pods["podd-c1"].create_command()[1:] == ["create-cpu", "podd-c1", IMAGE_A, "cpu3g", "8", "20"]
     assert "8 vCPU ($0.32/h, 4 job(s) a pod, 32 GB) of cpu3g $0.04/vCPU-h" in said.getvalue(), said.getvalue()
 
 
@@ -863,7 +893,7 @@ def test_pod_sh_create_cpu_asks_runpod_for_a_cpu_pod_of_the_flavors_and_vcpu():
                          "printf '%s\\n500' '{\"error\":\"create pod: There are no instances currently available\"}'\n")
     fake_curl.chmod(0o755)
     environment = {**os.environ, "HOME": str(root), "PATH": f"{root / 'bin'}:{os.environ['PATH']}"}
-    created = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), "create-cpu", "podd-9", IMAGE_A, "cpu3g,cpu3c", "8"],
+    created = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), "create-cpu", "podd-9", IMAGE_A, "cpu3g,cpu3c", "8", "20"],
                              capture_output=True, text=True, env=environment, stdin=subprocess.DEVNULL)
     assert created.returncode == podd.POD_SH_NO_STOCK_EXIT, (created.returncode, created.stderr)
     arguments = (root / "curl-args").read_text().splitlines()
@@ -874,7 +904,7 @@ def test_pod_sh_create_cpu_asks_runpod_for_a_cpu_pod_of_the_flavors_and_vcpu():
     assert "not-a-key" not in "\n".join(arguments), "the key reaches curl only through a header file"
     fake_curl.write_text("#!/usr/bin/env bash\nprintf '%s\\n500' '{\"error\":\"create pod: There are no longer any "
                          "instances available with the requested specifications.\"}'\n")    # a CPU size out, 2026-10-15
-    refused = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), "create-cpu", "podd-9", IMAGE_A, "cpu3c", "16"],
+    refused = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), "create-cpu", "podd-9", IMAGE_A, "cpu3c", "16", "20"],
                              capture_output=True, text=True, env=environment, stdin=subprocess.DEVNULL)
     assert refused.returncode == podd.POD_SH_NO_STOCK_EXIT, (refused.returncode, refused.stderr)
 
@@ -1180,7 +1210,7 @@ def test_a_pod_much_slower_than_the_median_is_marked_slow_its_resumable_jobs_mov
     # a slow pod serves no set: placement skips it, the opening rule replaces it, and the new pod avoids US-MD-1
     pod = podd.Pod("podd-c4", pool.secrets, CPU_REQUIRES, pool.config, ["cpu3c"], 1, 8,
                    pool.avoided_datacenters("cpu"))
-    assert pod.create_command()[1:] == ["create-cpu", "podd-c4", IMAGE_A, "cpu3c", "8", "US-MD-1"]
+    assert pod.create_command()[1:] == ["create-cpu", "podd-c4", IMAGE_A, "cpu3c", "8", "20", "US-MD-1"]
     pool.slow_datacenters["cpu"]["US-MD-1"]["until_unix"] = time.time() - 1
     with contextlib.redirect_stdout(io.StringIO()) as said:
         assert pool.avoided_datacenters("cpu") == [], "avoided for SLOW_DATACENTER_HOURS, then forgiven"
@@ -1355,14 +1385,25 @@ def test_pod_sh_create_avoids_the_slow_datacenters():
         assert created.returncode == podd.POD_SH_NO_STOCK_EXIT, (created.returncode, created.stderr)
         sent = (root / "curl-args").read_text().splitlines()
         return json.loads(sent[sent.index("--data") + 1]), created.stderr
-    body, _ = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "US-MD-1,EU-SE-1")
+    body, _ = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "20", "US-MD-1,EU-SE-1")
     assert "US-MD-1" not in body["dataCenterIds"] and "EU-SE-1" not in body["dataCenterIds"]
     assert "EU-RO-1" in body["dataCenterIds"] and len(body["dataCenterIds"]) == 28, body["dataCenterIds"]
-    body, _ = body_of("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "12.8", "US-MD-1")
+    body, _ = body_of("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "12.8", "30", "US-MD-1")
     assert "US-MD-1" not in body["dataCenterIds"] and len(body["dataCenterIds"]) == 29
-    body, _ = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8")
+    assert body["containerDiskInGb"] == 30
+    body, _ = body_of("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "12.8", "80")
+    assert body["containerDiskInGb"] == 80 and "dataCenterIds" not in body, body
+    body, _ = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "80")
+    assert body["containerDiskInGb"] == 80, body
+    for arguments in (("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "12.8", "US-MD-1"),   # the old call, no disk
+                      ("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "79.5"), ("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8")):
+        refused = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), *arguments], capture_output=True, text=True,
+                                 env=environment, stdin=subprocess.DEVNULL)
+        assert refused.returncode not in (0, podd.POD_SH_NO_STOCK_EXIT) and "disk" in refused.stderr, (arguments,
+                                                                                                      refused.stderr)
+    body, _ = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "20")
     assert "dataCenterIds" not in body, "no avoid list: any datacenter"
-    body, said = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "XX-NOWHERE-1")
+    body, said = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "20", "XX-NOWHERE-1")
     assert "not in RUNPOD_DATACENTERS" in said, said
 
 

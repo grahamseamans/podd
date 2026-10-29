@@ -28,7 +28,9 @@ THE JOB FILE:
                  opens a pod for the job). Optional: `gpu` ("any" card, the default; a list of acceptable card
                  names; or "none": a CPU pod, no card at all, one of the config's cpu_flavors, sized by the job's
                  cpu / ram_gb: podd.daemon cpu_pod_plan), `gpu_memory_gb_min` (decimal GB, nvidia-smi's
-                 total; never with "none"), `cpu_min` (the pod's CPU quota). EVERY OTHER
+                 total; never with "none"), `cpu_min` (the pod's CPU quota), `disk_gb_min` (decimal GB of the
+                 pod's container disk, RunPod's containerDiskInGb for it: podd creates a pod for the job with at
+                 least that; on a CPU pod at most 10 GB a vCPU, podd.daemon cpu_pod_plan). EVERY OTHER
                  KEY is a fact the image declares in /etc/podd-facts.json, matched by equality: a value, or a list of
                  acceptable values (an image without the key does not match).
     cpu          the cores it keeps busy (a positive number), or "all": the pod's whole CPU quota (it runs alone).
@@ -62,7 +64,8 @@ THE JOB FILE:
 
 AN IMAGE PODD CAN RUN starts sshd with RunPod's PUBLIC_KEY on its own (port 22), carries bash, awk, procps
 (ps/pkill/pgrep) and rsync, and declares its facts in /etc/podd-facts.json (a JSON object; podd measures pod_name,
-pod_id, image, gpu, gpu_memory_gb, cpu, datacenter, cost_per_hr, ready_at itself, so an image may not declare those).
+pod_id, image, gpu, gpu_memory_gb, cpu, ram_gb, disk_gb, datacenter, cost_per_hr, ready_at itself, so an image may
+not declare those).
 """
 import datetime
 import json
@@ -73,8 +76,9 @@ from pathlib import Path
 JOB, RUNNING, DONE, FAILED = "JOB", "RUNNING", "DONE", "FAILED"
 STATES = (FAILED, DONE, RUNNING, JOB)                  # a stage's state: the first of these present
 COMMAND_LOG = "command.log"                            # the command's stdout + stderr, always pulled back
-POD_MEASURED_REQUIREMENTS = ("image", "gpu", "gpu_memory_gb_min", "cpu_min")   # podd's own; any other key is a fact
-                                                                               # the image declares
+POD_MEASURED_REQUIREMENTS = ("image", "gpu", "gpu_memory_gb_min", "cpu_min", "disk_gb_min")   # podd's own; any
+                                                                                     # other key is a fact the image
+                                                                                     # declares
 JOB_KEYS = ("command", "inputs", "outputs", "requires", "cpu", "gpu_memory_gb", "expected_s")
 OPTIONAL_JOB_KEYS = ("ram_gb", "progress", "resumable", "resume_from", "label", "queued_at", "attempts")
 PODD_ATTEMPTS_DIRECTORY = ".podd"                      # in the stage: each requeued attempt's command.log
@@ -187,8 +191,8 @@ def job_problems(job):
             if gpu == "none" and job.get("gpu_memory_gb", 0) != 0:
                 problems.append(f"`gpu_memory_gb` {job.get('gpu_memory_gb')!r} with `requires.gpu` \"none\": a CPU "
                                 f"pod has no card (0)")
-            for key in ("gpu_memory_gb_min", "cpu_min"):
-                if key in requires and not (isinstance(requires[key], (int, float)) and requires[key] > 0):
+            for key in ("gpu_memory_gb_min", "cpu_min", "disk_gb_min"):
+                if key in requires and not (is_number(requires[key]) and requires[key] > 0):
                     problems.append(f"`requires.{key}` must be a positive number")
             for key, value in requires.items():
                 if key not in POD_MEASURED_REQUIREMENTS and acceptable(value) == []:

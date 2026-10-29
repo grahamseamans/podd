@@ -18,7 +18,8 @@ a pod without it is refused), the image tag podd launched it from, nvidia-smi's 
 pod without nvidia-smi has gpu null and gpu_memory_gb 0: a CPU pod),
 the cgroup CPU quota (else its cpuset's CPU count), the RAM (cgroup memory.max, else MemTotal, at most RunPod's
 memoryInGb for the pod: a RunPod
-container has no memory limit and sees the host's), and pod.sh's price and datacenter. A job
+container has no memory limit and sees the host's), and pod.sh's price, datacenter and container disk (RunPod's
+containerDiskInGb for the pod: disk_gb). A job
 runs on a pod whose facts satisfy its `requires`. The pod's CAPACITY is its cpu, gpu_memory_gb and ram_gb facts.
 
 THE POOL: RESOURCE PACKING. A job declares the
@@ -35,14 +36,16 @@ expected seconds: its `expected_s` (required). A job on a slow or broken pod sta
 pod's capacity is the last one podd measured (else
 FIRST_GUESS_CAPACITY; its card memory the smallest card the set accepts), and it counts for at least one job of a set
 it serves (opened for it, or a stricter one with an image it accepts: booting_pod_serves).
-A pod is opened FOR a set: the set's first acceptable image, minVCPUPerGPU = ceil(cpu_min), and EVERY card of the
+A pod is opened FOR a set: the set's first acceptable image, minVCPUPerGPU = ceil(cpu_min), a container disk of
+container_disk_gb (the default, or the set's disk_gb_min when larger), and EVERY card of the
 config that the set accepts (name, gpu_memory_gb_min) AND that costs at most max_price_per_hour (pod.sh avail, asked
 at most every OFFERS_SECONDS), the ones listed in stock first, each group cheapest first: RunPod rents the first it
 has (gpuTypePriority custom). Stock orders the list and never gates it: the listing races the create.
 CPU PODS. A set with requires.gpu "none" runs on a pod with no card: RunPod's
 computeType CPU, one of the config's cpu_flavors (cpu3c, cpu5c, ...: price per vCPU-hour and RAM per vCPU from pod.sh
 avail-cpu), its vcpuCount a power of two. cpu_pod_plan sizes it from the set's waiting jobs: as many of them as one
-pod of the flavor holds (by cpu and ram_gb, at most its vcpu_max, under max_price_per_hour), the flavor whose price
+pod of the flavor holds (by cpu and ram_gb, and enough vCPUs for its container disk at CPU_DISK_GB_PER_VCPU; at most
+its vcpu_max, under max_price_per_hour), the flavor whose price
 per job is the lowest; create is offered every flavor that holds the same jobs at that vcpuCount, listed-in-stock
 first, cheapest first. A booting CPU pod's capacity is that plan. Facts, packing, idling and stock are the GPU pods'.
 SHORT OF STOCK IS NOT A FAILURE. pod.sh create exits POD_SH_NO_STOCK_EXIT when RunPod has no instance of any card
@@ -159,6 +162,14 @@ OFFERS_SECONDS = 60                  # pod.sh avail (prices, stock) at most this
 # (cgroup quota 7.65 cores, 2026-10-13; RAM: RunPod's gpuTypes minMemory 50 GB for the A40, 2026-10-14). The card
 # memory is never guessed from this: it is the smallest card the set accepts (the config's memory_gb).
 FIRST_GUESS_CAPACITY = {"cpu": 7.65, "ram_gb": 50.0}
+# THE CONTAINER DISK a pod is created with (pod.sh create / create-cpu say why these): the default of its kind, or the
+# set's requires.disk_gb_min when larger (container_disk_gb; 2026-10-29: a training job decompresses a 46.3 GB
+# dataset on the pod). A CPU pod's disk is capped at CPU_DISK_GB_PER_VCPU a vCPU (cpu3*: GraphQL
+# cpuFlavors.diskLimitPerVcpu 2026-10-15, and references/runpod/docs/flash/configuration/cpu-types.mdx; cpu5c 15
+# there: the smaller holds on every flavor), so cpu_pod_plan sizes a CPU pod's vCPUs for its disk too.
+GPU_CONTAINER_DISK_GB = 30
+CPU_CONTAINER_DISK_GB = 20
+CPU_DISK_GB_PER_VCPU = 10
 CREATE_RETRY_SECONDS = 300           # after a failed pod.sh create, that set's next create waits this long
 POD_SH_NO_STOCK_EXIT = 75            # pod.sh create's exit when RunPod has no instance of any card offered (EX_TEMPFAIL)
 STOCK_RETRY_FIRST_SECONDS = 60       # after a stock miss the set's next create waits this, doubling per miss in a row,
@@ -189,8 +200,8 @@ CPU_ON_THE_POD = ("cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo none; "
                   "env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc")
 # the RAM the container may use: cgroup v2's memory.max (bytes, or "max": no limit -> MemTotal of /proc/meminfo, kB)
 RAM_ON_THE_POD = "cat /sys/fs/cgroup/memory.max 2>/dev/null || echo none; grep MemTotal /proc/meminfo"
-MEASURED_FACTS = ("pod_name", "pod_id", "image", "gpu", "gpu_memory_gb", "cpu", "ram_gb", "datacenter",
-                  "cost_per_hr", "ready_at")
+MEASURED_FACTS = ("pod_name", "pod_id", "image", "gpu", "gpu_memory_gb", "cpu", "ram_gb", "disk_gb",
+                  "datacenter", "cost_per_hr", "ready_at")
 
 
 class PodError(RuntimeError):
@@ -245,6 +256,8 @@ def unmet_requirements(requires, facts):
         unmet.append(f"gpu memory {facts.get('gpu_memory_gb')} GB < {requires['gpu_memory_gb_min']}")
     if "cpu_min" in requires and not (facts.get("cpu") or 0) >= requires["cpu_min"]:
         unmet.append(f"cpu {facts.get('cpu')} < {requires['cpu_min']}")
+    if "disk_gb_min" in requires and not (facts.get("disk_gb") or 0) >= requires["disk_gb_min"]:
+        unmet.append(f"container disk {facts.get('disk_gb')} GB < {requires['disk_gb_min']}")
     for key, value in requires.items():
         if key in job_contract.POD_MEASURED_REQUIREMENTS:
             continue
@@ -278,7 +291,7 @@ def booting_pod_serves(opened_for, wanted, cards):
     gpu = wanted.get("gpu", "any")
     if gpu != "any" and not set(cards_for(opened_for, cards)) <= set(gpu):
         return False
-    for minimum in ("gpu_memory_gb_min", "cpu_min"):
+    for minimum in ("gpu_memory_gb_min", "cpu_min", "disk_gb_min"):
         if opened_for.get(minimum, 0) < wanted.get(minimum, 0):
             return False
     return all(key in opened_for and set(map(json.dumps, job_contract.acceptable(opened_for[key])))
@@ -467,12 +480,20 @@ def pod_kind(requires):
     return "cpu" if is_cpu_set(requires) else "gpu"
 
 
+def container_disk_gb(requires):
+    """The container disk (whole GB: RunPod's containerDiskInGb is an integer) a pod opened for this set is created
+    with: its kind's default, or the set's disk_gb_min when larger."""
+    default = CPU_CONTAINER_DISK_GB if is_cpu_set(requires) else GPU_CONTAINER_DISK_GB
+    return max(default, math.ceil(requires.get("disk_gb_min", 0)))
+
+
 def cpu_pod_plan(jobs, requires, flavors, offers, max_price_per_hour, vcpu_ceiling=None):
     """THE CPU POD'S SIZE (pure). jobs: the set's waiting jobs; flavors: the config's cpu_flavors; offers: pod.sh
     avail-cpu's JSON ({flavor: {price_per_vcpu_hour, ram_gb_per_vcpu, vcpu_min, vcpu_max, stock} or null}) ->
     ({vcpu, flavors, jobs_per_pod, capacity, price_per_hour}, None) or (None, why). Per flavor: k of the jobs (the
     largest cpu and ram_gb of them each; a cpu "all" job alone, sized by cpu_min) fit vcpu = the power of two at least
-    max(k x cpu, k x ram_gb / ram_gb_per_vcpu, cpu_min, vcpu_min); k as many as are waiting, fewer while vcpu exceeds
+    max(k x cpu, k x ram_gb / ram_gb_per_vcpu, cpu_min, container_disk_gb / CPU_DISK_GB_PER_VCPU, vcpu_min); k as many
+    as are waiting, fewer while vcpu exceeds
     vcpu_max or the price max_price_per_hour. The plan is the flavor with the lowest price per job (then more jobs a
     pod, then in stock, then the config's order); create is offered every flavor that holds those k jobs at that vcpu
     under the cap, listed-in-stock first, cheapest first (RunPod rents the first it has: cpuFlavorPriority custom).
@@ -482,13 +503,15 @@ def cpu_pod_plan(jobs, requires, flavors, offers, max_price_per_hour, vcpu_ceili
     job_cpu = max([job["cpu"] for job in jobs if job["cpu"] != "all"] or [0])
     job_ram = max(job.get("ram_gb", 0) for job in jobs)
     cpu_min = requires.get("cpu_min", 0)
+    disk_gb = container_disk_gb(requires)
 
     def largest(offer):
         ceiling = offer["vcpu_max"] if vcpu_ceiling is None else max(vcpu_ceiling, size(offer, 1))
         return min(offer["vcpu_max"], ceiling)
 
     def size(offer, count):
-        need = max(count * job_cpu, count * job_ram / offer["ram_gb_per_vcpu"], cpu_min, offer["vcpu_min"], 1)
+        need = max(count * job_cpu, count * job_ram / offer["ram_gb_per_vcpu"], cpu_min, disk_gb / CPU_DISK_GB_PER_VCPU,
+                   offer["vcpu_min"], 1)
         vcpu = 1
         while vcpu < need - 1e-9:
             vcpu *= 2
@@ -514,7 +537,8 @@ def cpu_pod_plan(jobs, requires, flavors, offers, max_price_per_hour, vcpu_ceili
         candidates.append(((price / count, -count, not offer["stock"], order), flavor, vcpu, count))
     if not candidates:
         return None, ("PRICE CAP / SIZE: no CPU flavor holds a job of " + json.dumps(
-            {"cpu": "all" if alone else job_cpu, "ram_gb": job_ram, "cpu_min": cpu_min}) + "; " + "; ".join(misses))
+            {"cpu": "all" if alone else job_cpu, "ram_gb": job_ram, "cpu_min": cpu_min, "disk_gb": disk_gb})
+            + "; " + "; ".join(misses))
     _, best, vcpu, count = min(candidates)
     offered = [flavor for flavor in flavors if offers.get(flavor) and size(offers[flavor], count) <= vcpu
                and vcpu <= largest(offers[flavor])
@@ -561,7 +585,8 @@ def facts_of_pod(image_facts_text, gpu_text, cpu_text, ram_text, image, session,
         ram_gb = min(ram_gb, session["memory_gb"])  # and sees the host's RAM (540 GB on an A40 host, 2026-10-14)
     return {**image_facts, "pod_name": name, "pod_id": pod_id, "image": image, "gpu": gpu_name,
             "gpu_memory_gb": round(int(gpu_memory_mib) * 1048576 / 1e9, 2), "cpu": cpu, "ram_gb": ram_gb,
-            "datacenter": session.get("datacenter"), "cost_per_hr": session.get("cost_per_hr"), "ready_at": now_text}
+            "disk_gb": session.get("container_disk_gb"), "datacenter": session.get("datacenter"),
+            "cost_per_hr": session.get("cost_per_hr"), "ready_at": now_text}
 
 
 def cpu_of(cpu_text):
@@ -685,10 +710,11 @@ class Pod:
         image = job_contract.acceptable(self.requires["image"])[0]
         avoid = [",".join(self.avoid_datacenters)] if self.avoid_datacenters else []
         if is_cpu_set(self.requires):
-            return [str(POD_SCRIPT), "create-cpu", self.name, image, ",".join(self.cards), str(self.vcpu), *avoid]
+            return [str(POD_SCRIPT), "create-cpu", self.name, image, ",".join(self.cards), str(self.vcpu),
+                    str(container_disk_gb(self.requires)), *avoid]
         return [str(POD_SCRIPT), "create", self.name, image, ",".join(self.cards),
                 str(math.ceil(self.requires.get("cpu_min", 1))), ",".join(self.config["allowed_cuda_versions"]),
-                *avoid]
+                str(container_disk_gb(self.requires)), *avoid]
 
     def boot(self):
         """pod.sh create, ship podd-run.sh, read the facts once; ready, mismatch, or boot failed, with the reason."""
