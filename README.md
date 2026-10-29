@@ -58,16 +58,16 @@ pod.sh, no ssh, no rsync.
   A GPU create asks RunPod for ANY host (its `allowedCudaVersions` enum stops at 13.0, so a list shut out every newer
   driver: 2026-10-29, every create refused for 30+ min while A40s and L4s under the cap were in stock); podd measures
   the driver on the pod (`cuda_version`) and deletes a pod below this at once, loudly, avoids its datacenter for GPU
-  pods for `OLD_DRIVER_DATACENTER_HOURS` (even while short of stock: such a pod runs nothing), and counts it as a
-  stock miss (the jobs stay JOB). An image that refuses the driver at container start (`NVIDIA_REQUIRE_CUDA`) never
+  pods for `OLD_DRIVER_DATACENTER_HOURS` (even while its set waits for a pod: such a pod runs nothing), and counts it as a
+  no-pod miss (the jobs stay JOB). An image that refuses the driver at container start (`NVIDIA_REQUIRE_CUDA`) never
   opens ssh: `pod.sh create` gives up after 15 min, a boot failure (a miss, like stock). The old key `allowed_cuda_versions` is refused by
   name.
 - `cpu_flavors`: the RunPod CPU flavors a CPU pod may be (`pod.sh avail-cpu`: $/vCPU-h and RAM per vCPU from the REST
   v2 catalog).
 - `boot_seconds` (default 150, the measured 97-155 s): podd opens another pod only while the backlog would take
   longer than this to drain on the pods up or booting.
-- `max_wait_for_stock_minutes` (default 60): RunPod refusing a create for stock ("no instances currently available"),
-  and a pod that did not boot (`pod.sh create` failed, or podd could not read the pod), is waited out, never a failure
+- `max_wait_for_a_pod_minutes` (default 60): a set with no pod it can run on -- RunPod refusing a create for stock ("no
+  instances currently available"), no card under the price cap, a pod on an old driver, a pod that did not boot (`pod.sh create` failed, or podd could not read the pod), is waited out, never a failure
   on its own: the jobs stay JOB and podd retries one pod after 60 s, doubling to 10 min, avoiding
   no slow datacenter (an old driver's still: such a pod runs nothing). While a pod of the set runs, its jobs wait for it however long; a set with NO
   pod for this long FAILS its jobs with every miss. `podd status` shows each wait and when it would fail.
@@ -174,7 +174,7 @@ the pod has work): the backstop for a podd that died.
 |---|---|
 | `~/.config/podd/config.json` | the config (read once, at start) |
 | `~/.local/state/podd/PODS.json` | the pool, rewritten whenever it changes (no secrets); `podd status` prints it |
-| `~/.local/state/podd/avoided-datacenters.json` | `{"gpu" \| "cpu": {datacenter: {..., "because": "slow" \| "old driver"}}}`: datacenters that kind's creates avoid: a SLOW pod's for `SLOW_DATACENTER_HOURS` unless the set is short of stock, an old driver's (GPU) for `OLD_DRIVER_DATACENTER_HOURS` always (delete an entry to forgive one, then restart) |
+| `~/.local/state/podd/avoided-datacenters.json` | `{"gpu" \| "cpu": {datacenter: {..., "because": "slow" \| "old driver"}}}`: datacenters that kind's creates avoid: a SLOW pod's for `SLOW_DATACENTER_HOURS` unless the set is waiting for a pod, an old driver's (GPU) for `OLD_DRIVER_DATACENTER_HOURS` always (delete an entry to forgive one, then restart) |
 | `$SECRETS/runpod_api_key`, `$SECRETS/runpod_pods/` | the key, and pod.sh's per-pod files |
 
 ## Tests

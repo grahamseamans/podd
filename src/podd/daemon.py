@@ -12,7 +12,7 @@ queue_directories (absolute paths; each subdirectory is a stage), max_pods ({"gp
 pods are capped apart, 2026-10-15), idle_minutes, max_price_per_hour, cards (the cards a pod may
 be, each {name, memory_gb}), min_cuda_version (the lowest driver CUDA version a GPU pod may have), cpu_flavors, and,
 with defaults,
-boot_seconds (150) and max_wait_for_stock_minutes (60).
+boot_seconds (150) and max_wait_for_a_pod_minutes (60).
 
 A POD'S FACTS, read ONCE when it boots: /etc/podd-facts.json (what its image declares: README.md "Images";
 a pod without it is refused), the image tag podd launched it from, nvidia-smi's card name and memory (decimal GB; a
@@ -50,14 +50,14 @@ pod of the flavor holds (by cpu and ram_gb, and enough vCPUs for its container d
 its vcpu_max, under max_price_per_hour), the flavor whose price
 per job is the lowest; create is offered every flavor that holds the same jobs at that vcpuCount, listed-in-stock
 first, cheapest first. A booting CPU pod's capacity is that plan. Facts, packing, idling and stock are the GPU pods'.
-SHORT OF STOCK IS NOT A FAILURE. pod.sh create exits POD_SH_NO_STOCK_EXIT when RunPod has no instance of any card
+NO POD YET IS NOT A FAILURE. pod.sh create exits POD_SH_NO_STOCK_EXIT when RunPod has no instance of any card
 offered; podd says so loudly once per attempt, the set's jobs stay JOB, and its next create waits
-stock_backoff_seconds (60 s doubling to 10 min) and is ONE pod (a probe, not a burst), avoiding no slow datacenter,
+no_pod_backoff_seconds (60 s doubling to 10 min) and is ONE pod (a probe, not a burst), avoiding no slow datacenter,
 until a create succeeds. No card under the cap counts the same way, and so does a pod on an old driver, and so does a
 pod that did not boot (2026-10-29: pod.sh create exited 1, "no public ssh port after 15 min"; a pause of its own
-FAILED the set's jobs, and a job queued during it, with no create of its own): ONE wait, StockWait. A set short
-of stock that has had NO pod (none ready or
-slow serving it, no job of it running) for more than max_wait_for_stock_minutes FAILS its waiting jobs with every miss
+FAILED the set's jobs, and a job queued during it, with no create of its own): ONE wait, NoPodWait. A set waiting
+for a pod that has had NO pod (none ready or
+slow serving it, no job of it running) for more than max_wait_for_a_pod_minutes FAILS its waiting jobs with every miss
 (time, cards offered, RunPod's answer); while a pod serves it, they wait. The waits are in the status file. A pod whose facts do not
 satisfy the set it was opened for is deleted and the set's waiting jobs FAIL with the mismatch, as do later jobs of
 that set until podd restarts (a create loop would bill forever). A ready pod with no job for idle_minutes is deleted
@@ -66,13 +66,13 @@ podd-c<max_pods.cpu> (pod.sh's name: its id file, lease,
 alias runpod-<name>).
 
 EACH POD'S LIFE. Booting: `pod.sh create` in its own thread (never in a datacenter recorded slow for its kind, unless
-its set is short of stock: below; never in one recorded for an old driver), then podd
+its set is waiting for a pod: below; never in one recorded for an old driver), then podd
 ships podd-run.sh and reads the facts. OLD DRIVER (2026-10-29): a GPU create asks RunPod for any host (RunPod's
 allowedCudaVersions enum stops at 13.0, so a list of versions shut out every newer driver, and the only stock under the
 cap was on such hosts); a GPU pod whose measured cuda_version is below min_cuda_version (compared as integer tuples)
-is deleted at once, its datacenter avoided by GPU creates for OLD_DRIVER_DATACENTER_HOURS even while its set is short
-of stock (an old-driver pod runs nothing, unlike a slow one), and the miss counts as a stock miss: the jobs stay JOB,
-the next create backs off, and a set with no pod for max_wait_for_stock_minutes FAILS (Pool.reject_old_driver).
+is deleted at once, its datacenter avoided by GPU creates for OLD_DRIVER_DATACENTER_HOURS even while its set waits
+for a pod (an old-driver pod runs nothing, unlike a slow one), and the miss counts as a no-pod miss: the jobs stay JOB,
+the next create backs off, and a set with no pod for max_wait_for_a_pod_minutes FAILS (Pool.reject_old_driver).
 An image that refuses the old driver at container start (NVIDIA_REQUIRE_CUDA: "OCI runtime create failed") never
 opens ssh: pod.sh create gives up after 15 min and exits 1, which is a boot failure like any other (a miss). Ready: takes jobs.
 SLOW or BROKEN: takes no more, deleted once empty. Deleted
@@ -104,7 +104,7 @@ SLOW HOSTS (judge_speeds, every pass). A job with `progress` (`<done> <total>`) 
 unit on (seconds_per_unit); its PACE is that over its own expected seconds per unit (pace_of), judged against the
 MEDIAN pace of at least MIN_REFERENCE_PODS other pods running the same command AT THE SAME LOAD (as many jobs on its
 pod; reference_pace), else not at all: a pod running N jobs at once is not slow for it, and expected_s alone only
-scales a lone job's deadline. At SLOW_FACTOR or more its pod is SLOW (mark_slow) -- unless its set is short of stock
+scales a lone job's deadline. At SLOW_FACTOR or more its pod is SLOW (mark_slow) -- unless its set is waiting for a pod
 (nothing would replace it: kept, said once): it takes no more jobs and serves no set (the opening rule replaces it),
 its resumable jobs are stopped and requeued when the move saves more than a boot (worth_moving; each at most
 MAX_SLOW_STOPS times), its others run on under the scaled deadline, and its datacenter goes in AVOIDED_DATACENTERS_FILE
@@ -112,7 +112,7 @@ under its kind: that kind's creates avoid it for SLOW_DATACENTER_HOURS. A pod's 
 measured) scales its jobs' deadlines. All said loudly.
 
 NOTHING FAILS QUIETLY. A pod that did not boot (pod.sh create failed, or podd could not ship podd-run.sh or read its
-facts) is said, deleted, and is a miss of its set like a stock miss: its jobs stay JOB until max_wait_for_stock_minutes
+facts) is said, deleted, and is a miss of its set like a stock miss: its jobs stay JOB until max_wait_for_a_pod_minutes
 with no pod, then FAIL with every miss. A job no pod can ever run (no pod size holds it, or a pod opened for its set
 did not satisfy it) FAILS at once. A broken JOB (job_contract.job_problems) FAILS with
 every problem. Only a resumable job is ever requeued, and only by podd (never a failed one).
@@ -190,8 +190,8 @@ GPU_CONTAINER_DISK_GB = 30
 CPU_CONTAINER_DISK_GB = 20
 CPU_DISK_GB_PER_VCPU = 10
 POD_SH_NO_STOCK_EXIT = 75            # pod.sh create's exit when RunPod has no instance of any card offered (EX_TEMPFAIL)
-STOCK_RETRY_FIRST_SECONDS = 60       # after a stock miss the set's next create waits this, doubling per miss in a row,
-STOCK_RETRY_MAX_SECONDS = 600        # at most this; the set's jobs stay JOB until max_wait_for_stock_minutes
+NO_POD_RETRY_FIRST_SECONDS = 60       # after a miss (NoPodWait) the set's next create waits this, doubling per miss in a row,
+NO_POD_RETRY_MAX_SECONDS = 600        # at most this; the set's jobs stay JOB until max_wait_for_a_pod_minutes
 DELETE_RETRY_SECONDS = 60           # a pod whose delete failed is deleted again this often (Pool.forget)
 SSH_FAILURES_ALLOWED = 3             # consecutive failed exit polls that fail the job
 SSH_COMMAND_TIMEOUT_S = 600          # one ssh / rsync; a hung connection is a failure, never a hang
@@ -576,10 +576,10 @@ def cpu_pod_plan(jobs, requires, flavors, offers, max_price_per_hour, vcpu_ceili
             "price_per_hour": round(vcpu * offers[best]["price_per_vcpu_hour"], 4)}, None
 
 
-def stock_backoff_seconds(misses):
-    """After the misses-th create in a row that RunPod refused for stock: STOCK_RETRY_FIRST_SECONDS, doubling, at most
-    STOCK_RETRY_MAX_SECONDS."""
-    return min(STOCK_RETRY_FIRST_SECONDS * 2 ** (misses - 1), STOCK_RETRY_MAX_SECONDS)
+def no_pod_backoff_seconds(misses):
+    """After the misses-th attempt in a row that got the set no pod it can run on (NoPodWait): NO_POD_RETRY_FIRST_SECONDS,
+    doubling, at most NO_POD_RETRY_MAX_SECONDS."""
+    return min(NO_POD_RETRY_FIRST_SECONDS * 2 ** (misses - 1), NO_POD_RETRY_MAX_SECONDS)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1077,10 +1077,10 @@ class Running:
         return None if self.done is None else f"{self.done}/{self.total}"
 
 
-class StockWait:
+class NoPodWait:
     """A requirement set RunPod could not give a pod (no stock, no card under the cap, an old driver, a pod that did not
-    boot: Pool.stock_miss): since when, since when it has had NO pod (None while a pod
-    serves it: the max wait's clock, Pool.fail_the_jobs_that_waited_too_long_for_stock), how many attempts missed in a
+    boot: Pool.no_pod_miss): since when, since when it has had NO pod (None while a pod
+    serves it: the max wait's clock, Pool.fail_the_jobs_that_waited_too_long_for_a_pod), how many attempts missed in a
     row, when the next create may go, the last attempt counted, and every miss (the story its jobs FAIL with past the
     max wait)."""
 
@@ -1100,14 +1100,14 @@ class Pool:
         self.paces_by_command = {}         # command -> {attempt key: (pace, load, pod id, measured at)}: judge_speeds
         self.avoided_datacenter_records = read_avoided_datacenters()   # kind -> datacenter -> {until_unix, until,
                                                                        # why, pod, because}
-        self.slow_kept_said = set()        # pods measured slow but kept (their set is short of stock): said once
+        self.slow_kept_said = set()        # pods measured slow but kept (their set is waiting for a pod): said once
         self.last_capacity = None          # the capacity of the last GPU pod podd read: a booting GPU pod's guess
         self.offers = None                 # (time, pod.sh avail's JSON) of the cards the config lists
         self.cpu_offers = None             # (time, pod.sh avail-cpu's JSON) of the config's cpu_flavors
         self.undeleted = {}                # pod name -> (pod, reason, when): its delete failed; retried (forget)
         self.cpu_vcpu_ceiling = {}         # requirement key -> the largest CPU pod to ask for after a stock miss
         self.attempts = {}                 # requirement key -> how many create attempts podd made for it
-        self.short_of_stock = {}           # requirement key -> StockWait: RunPod refused its last create for stock
+        self.waiting_for_a_pod = {}        # requirement key -> NoPodWait: its last attempt got no pod it can run on
 
     def free_name(self, kind):
         """podd-g1 .. / podd-c1 .. podd-<kind initial><max_pods[kind]>: the first name of the kind no pod of the pool
@@ -1151,9 +1151,9 @@ class Pool:
             del self.undeleted[name]
             self.forget(pod, f"retrying the failed delete ({reason})")
 
-    def avoided_datacenters(self, kind, short_of_stock=False):
+    def avoided_datacenters(self, kind, waiting_for_a_pod=False):
         """The datacenters this kind's creates avoid now (the expired ones are said and dropped): a slow pod's (not
-        while the set is short of stock: a slow pod is better than none) and an old driver's (always: such a pod runs
+        while the set is waiting for a pod: a slow pod is better than none) and an old driver's (always: such a pod runs
         nothing). A CPU host's slowness says nothing of a GPU host's in the same datacenter, and the reverse."""
         recorded = self.avoided_datacenter_records.get(kind, {})
         for datacenter, record in list(recorded.items()):
@@ -1163,7 +1163,7 @@ class Pool:
                     f"{record['why']})")
                 write_avoided_datacenters(self.avoided_datacenter_records)
         return sorted(datacenter for datacenter, record in recorded.items()
-                      if not (short_of_stock and record["because"] == "slow"))
+                      if not (waiting_for_a_pod and record["because"] == "slow"))
 
     def avoid_datacenter(self, pod, because, why, hours):
         """Record the pod's datacenter as avoided by creates of its kind for `hours` (AVOIDED_DATACENTERS_FILE); said
@@ -1184,13 +1184,13 @@ class Pool:
 
     def reject_old_driver(self, pod):
         """A GPU pod whose driver is below min_cuda_version (Pod.boot: old_driver): deleted at once, its datacenter
-        avoided for OLD_DRIVER_DATACENTER_HOURS, and a stock miss for its set (RunPod gave no host the images run on):
+        avoided for OLD_DRIVER_DATACENTER_HOURS, and a no-pod miss for its set (RunPod gave no host the images run on):
         the jobs stay JOB and the next create backs off. All said loudly."""
         key = requirement_key(pod.requires)
         say(f"(╯°□°)╯ {pod.name} (pod {pod.facts.get('pod_id')}) {pod.problem}: deleting it; its jobs stay queued")
         self.avoid_datacenter(pod, "old driver", pod.problem, OLD_DRIVER_DATACENTER_HOURS)
         self.forget(pod, pod.problem)
-        self.stock_miss(key, pod.attempt, f"{pod.name} landed on a host it cannot use: {pod.problem}")
+        self.no_pod_miss(key, pod.attempt, f"{pod.name} landed on a host it cannot use: {pod.problem}")
 
     def count_loads(self):
         """Every running job's load: how many jobs its pod runs now, and the most during it (its deadline's factor)."""
@@ -1202,7 +1202,7 @@ class Pool:
         """SLOW HOSTS. Every running job with a measured rate (seconds_per_unit) has a pace (pace_of: over its own
         expected seconds per unit), judged against the median pace of other pods at the same load (reference_pace: the
         load of a rate is the most jobs its pod ran over the units measured); at SLOW_FACTOR or more its pod is SLOW
-        (mark_slow) -- unless its set is short of stock: nothing would replace it, so it is kept and said. A job with no
+        (mark_slow) -- unless its set is waiting for a pod: nothing would replace it, so it is kept and said. A job with no
         reference is not judged; alone on its pod its slowness is its pace (expected_s's word, never a judgement). A
         pod's slowness, what its jobs' deadlines scale by, is the largest its jobs measured."""
         now = time.time()
@@ -1240,10 +1240,11 @@ class Pool:
                    f"{pods_measured} other pods running the same command, {load} job(s) at once >= SLOW_FACTOR "
                    f"{SLOW_FACTOR}")
             key = requirement_key(pod.requires)
-            if key in self.short_of_stock:
+            if key in self.waiting_for_a_pod:
                 if pod.name not in self.slow_kept_said:
                     self.slow_kept_said.add(pod.name)
-                    say(f"(・_・;) {pod.name} is slow ({why}), but RunPod has no stock to replace it: it is KEPT, its "
+                    say(f"(・_・;) {pod.name} is slow ({why}), but its set is waiting for a pod (nothing would replace it): it "
+                        f"is KEPT, its "
                         f"jobs' deadlines scaled by {pod.slowness:.2f}")
                 continue
             self.mark_slow(pod, why)
@@ -1321,7 +1322,7 @@ class Pool:
     def cards_to_ask(self, requires):
         """(cards, why none): every card of the config this set accepts at or under the price cap, in-stock first,
         cheapest first (affordable_cards; pod.sh avail, at most every OFFERS_SECONDS). No card: why, for the stock
-        wait (stock_miss), which says it and bounds it."""
+        wait (no_pod_miss), which says it and bounds it."""
         accepted = cards_for(requires, self.config["cards"])
         if self.offers is None or time.time() - self.offers[0] > OFFERS_SECONDS:
             asked = subprocess.run([str(POD_SCRIPT), "avail", ",".join(card["name"] for card in self.config["cards"])],
@@ -1351,46 +1352,46 @@ class Pool:
         return cpu_pod_plan(jobs, requires, self.config["cpu_flavors"], self.cpu_offers[1],
                             self.config["max_price_per_hour"], self.cpu_vcpu_ceiling.get(requirement_key(requires)))
 
-    def stock_miss(self, key, attempt, why):
+    def no_pod_miss(self, key, attempt, why):
         """RunPod gave the set no pod (its create was refused for stock, no card is under the cap, its pod landed on an
         old driver, or its pod did not boot): the set's next
-        create waits stock_backoff_seconds, its jobs stay JOB, and this is said loudly once per attempt (the creates
+        create waits no_pod_backoff_seconds, its jobs stay JOB, and this is said loudly once per attempt (the creates
         of one attempt that all miss count once). attempt None: the miss was podd's own check, never a create."""
-        wait = self.short_of_stock.setdefault(key, StockWait(time.time()))
+        wait = self.waiting_for_a_pod.setdefault(key, NoPodWait(time.time()))
         if attempt is not None and attempt <= wait.counted_attempt:
             wait.story[-1] += f"; and {why}"
             return
         wait.misses += 1
         wait.counted_attempt = attempt if attempt is not None else wait.counted_attempt
-        backoff_s = stock_backoff_seconds(wait.misses)
+        backoff_s = no_pod_backoff_seconds(wait.misses)
         wait.retry_at_s = time.time() + backoff_s
         wait.story.append(f"{job_contract.utc_now_text()} {why}")
         say(f"(╯°□°)╯ NO POD for {key}: {why}. Its jobs stay queued; the next create (every card under the cap) in "
             f"{backoff_s:.0f} s (miss {wait.misses} in a row, waiting {(time.time() - wait.first_miss_s) / 60:.1f} of "
-            f"max_wait_for_stock_minutes {self.config['max_wait_for_stock_minutes']})")
+            f"max_wait_for_a_pod_minutes {self.config['max_wait_for_a_pod_minutes']})")
 
-    def fail_the_jobs_that_waited_too_long_for_stock(self, waiting):
-        """A set short of stock that has had NO pod for max_wait_for_stock_minutes: its waiting jobs FAIL with every
+    def fail_the_jobs_that_waited_too_long_for_a_pod(self, waiting):
+        """A set waiting for a pod that has had NO pod for max_wait_for_a_pod_minutes: its waiting jobs FAIL with every
         miss. While a pod serves it (ready or slow, its facts satisfying the set) or a job of it runs, its jobs wait
         and the clock is reset (2026-10-22: 20 jobs FAILED "no pod for 60 min" while 3 pods of their set ran other
         chunks). A set with no job waiting any more forgets its wait."""
         waiting_keys = {requirement_key(job["requires"]) for _, job in waiting}
-        for key, wait in list(self.short_of_stock.items()):
+        for key, wait in list(self.waiting_for_a_pod.items()):
             if key not in waiting_keys:
-                del self.short_of_stock[key]
+                del self.waiting_for_a_pod[key]
                 continue
             if self.has_a_pod(key):
                 wait.podless_since_s = None
                 continue
             if wait.podless_since_s is None:
                 wait.podless_since_s = time.time()
-                say(f"(╯°□°)╯ {key}: short of stock and now with no pod: its jobs FAIL in "
-                    f"{self.config['max_wait_for_stock_minutes']} min (max_wait_for_stock_minutes) unless RunPod "
+                say(f"(╯°□°)╯ {key}: waiting for a pod and now with no pod: its jobs FAIL in "
+                    f"{self.config['max_wait_for_a_pod_minutes']} min (max_wait_for_a_pod_minutes) unless RunPod "
                     f"gives it one")
-            if time.time() - wait.podless_since_s > self.config["max_wait_for_stock_minutes"] * 60:
-                del self.short_of_stock[key]
-                self.fail_waiting(waiting, key, f"no pod for {self.config['max_wait_for_stock_minutes']} min "
-                                                f"(max_wait_for_stock_minutes): RunPod gave its requires no pod in "
+            if time.time() - wait.podless_since_s > self.config["max_wait_for_a_pod_minutes"] * 60:
+                del self.waiting_for_a_pod[key]
+                self.fail_waiting(waiting, key, f"no pod for {self.config['max_wait_for_a_pod_minutes']} min "
+                                                f"(max_wait_for_a_pod_minutes): RunPod gave its requires no pod in "
                                                 f"{wait.misses} attempts:\n  - " + "\n  - ".join(wait.story))
 
     def has_a_pod(self, key):
@@ -1404,7 +1405,7 @@ class Pool:
         """THE OPENING RULE per requirement set with jobs waiting, oldest set first (pods_to_open)."""
         booting = [pod for pod in self.pods.values() if pod.state == "booting"]
         for key in waiting_keys:
-            wait = self.short_of_stock.get(key)
+            wait = self.waiting_for_a_pod.get(key)
             if wait and (time.time() < wait.retry_at_s
                          or any(requirement_key(pod.requires) == key for pod in booting)):
                 continue                                 # backing off, or its one probe create is still out
@@ -1433,7 +1434,7 @@ class Pool:
                 continue
             if is_cpu_set(requires):
                 if not plan:
-                    self.stock_miss(key, None, why_no_plan)
+                    self.no_pod_miss(key, None, why_no_plan)
                     continue
                 cards = plan["flavors"]
                 offered = (f"{plan['vcpu']} vCPU (${plan['price_per_hour']}/h, {plan['jobs_per_pod']} job(s) a pod, "
@@ -1443,7 +1444,7 @@ class Pool:
             else:
                 cards, why_none = self.cards_to_ask(requires)
                 if not cards:
-                    self.stock_miss(key, None, why_none)
+                    self.no_pod_miss(key, None, why_none)
                     continue
                 offered = ", ".join(f"{card} ${self.offers[1][card]['price_per_hour']}/h" for card in cards)
             staggered = ""
@@ -1453,10 +1454,10 @@ class Pool:
                 f"pod(s) up or booting > boot_seconds {self.config['boot_seconds']}: opening {wanted}{staggered} "
                 f"(drain then {drain_seconds(backlog, serving + [(guess, True)] * wanted):.0f} s)")
             self.attempts[key] = self.attempts.get(key, 0) + 1
-            avoided = self.avoided_datacenters(kind, short_of_stock=bool(wait))
+            avoided = self.avoided_datacenters(kind, waiting_for_a_pod=bool(wait))
             forgiven = sorted(set(self.avoided_datacenters(kind)) - set(avoided))
             if forgiven:                                 # avoiding a slow datacenter must never cost a pod
-                say(f"(・_・;) {key} is short of stock: its create does not avoid the slow datacenters "
+                say(f"(・_・;) {key} is waiting for a pod: its create does not avoid the slow datacenters "
                     f"{', '.join(forgiven)}: a slow pod is better than none")
             for _ in range(wanted):
                 pod = Pod(self.free_name(kind), self.secrets, requires, self.config, cards, self.attempts[key],
@@ -1475,10 +1476,10 @@ class Pool:
         waiting = self.waiting_jobs()
         for pod in list(self.pods.values()):
             key = requirement_key(pod.requires)
-            if (pod.state == "ready" and key in self.short_of_stock     # a pod the set can use (not one on an old
-                    and pod.attempt > self.short_of_stock[key].counted_attempt):   # driver), made AFTER the miss
-                wait = self.short_of_stock.pop(key)    # (2026-10-15: a pod made before it cleared the wait every pass)
-                say(f"{pod.name}: RunPod gave {key} a pod after {wait.misses} stock miss(es), "
+            if (pod.state == "ready" and key in self.waiting_for_a_pod     # a pod the set can use (not one on an old
+                    and pod.attempt > self.waiting_for_a_pod[key].counted_attempt):   # driver), made AFTER the miss
+                wait = self.waiting_for_a_pod.pop(key)    # (2026-10-15: a pod made before it cleared the wait every pass)
+                say(f"{pod.name}: RunPod gave {key} a pod after {wait.misses} miss(es), "
                     f"{(time.time() - wait.first_miss_s) / 60:.1f} min")
             if pod.state == "no stock":
                 self.pods.pop(pod.name)
@@ -1487,12 +1488,12 @@ class Pool:
                     self.cpu_vcpu_ceiling[key] = ceiling
                     say(f"(・_・;) {pod.name}: no {pod.vcpu}-vCPU CPU pod in stock: the set's pods are at most {ceiling} "
                         f"vCPU from now on (one job's size at least)")
-                self.stock_miss(key, pod.attempt, f"{pod.name} was offered {', '.join(pod.cards)}; {pod.problem}")
+                self.no_pod_miss(key, pod.attempt, f"{pod.name} was offered {', '.join(pod.cards)}; {pod.problem}")
             elif pod.state == "boot failed":
                 self.pods.pop(pod.name)
                 say(f"(╯°□°)╯ {pod.name} did not boot: {pod.problem}; deleting it, its set's jobs stay queued")
                 self.forget(pod, "it failed its create or its read")
-                self.stock_miss(key, pod.attempt, f"{pod.name} did not boot: {pod.problem}")
+                self.no_pod_miss(key, pod.attempt, f"{pod.name} did not boot: {pod.problem}")
             elif pod.state == "old driver":
                 self.pods.pop(pod.name)
                 self.reject_old_driver(pod)
@@ -1508,7 +1509,7 @@ class Pool:
         for key, reason in self.mismatched.items():
             self.fail_waiting(waiting, key, f"no pod can satisfy this job's requires: a pod opened for it did not "
                                             f"({reason})")
-        self.fail_the_jobs_that_waited_too_long_for_stock(waiting)
+        self.fail_the_jobs_that_waited_too_long_for_a_pod(waiting)
 
         ready = {name: pod for name, pod in self.pods.items() if pod.state == "ready"}
         self.fail_the_jobs_no_pod_can_hold(waiting, ready)
@@ -1560,13 +1561,13 @@ class Pool:
                                     for stage, running in self.running.items() if running.pod_name == pod.name}}
                       for pod in sorted(self.pods.values(), key=lambda pod: pod.name)],
                   "avoided_datacenters": self.avoided_datacenter_records,
-                  "short_of_stock": {key: {
+                  "waiting_for_a_pod": {key: {
                       "misses": wait.misses, "since": utc_text(wait.first_miss_s),
                       "no_pod_since": utc_text(wait.podless_since_s) if wait.podless_since_s is not None else None,
-                      "fails_at": (utc_text(wait.podless_since_s + self.config["max_wait_for_stock_minutes"] * 60)
+                      "fails_at": (utc_text(wait.podless_since_s + self.config["max_wait_for_a_pod_minutes"] * 60)
                                    if wait.podless_since_s is not None else None),
                       "next_create_at": utc_text(wait.retry_at_s), "last": wait.story[-1][:300] if wait.story else None}
-                      for key, wait in self.short_of_stock.items()}}
+                      for key, wait in self.waiting_for_a_pod.items()}}
         if status != self.last_status:
             STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
             job_contract.write_json_atomically(STATUS_FILE, {**status, "written_at": job_contract.utc_now_text()})

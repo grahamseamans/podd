@@ -3,15 +3,15 @@ checked, a pod satisfies a job only when every requirement is met (the image's d
 any of them), a job goes to the fullest pod that satisfies it, jobs are packed on a pod by cpu / gpu memory / ram (best
 fit), pods are opened PER REQUIREMENT SET only while its backlog would outlast a boot (the drain time), offered every
 card under the price cap (in-stock first, cheapest first) and never one over it, RunPod short of stock leaves the jobs
-queued and retries after a backoff (avoiding no slow datacenter) until max_wait_for_stock_minutes, a job requiring an image no running pod has opens a pod for that image, a pod's facts are read
+queued and retries after a backoff (avoiding no slow datacenter) until max_wait_for_a_pod_minutes, a job requiring an image no running pod has opens a pod for that image, a pod's facts are read
 from what it prints (CPU quota, decimal GB, shadowing refused), the exit poll ends, a pod's ssh is through its own
 alias, a job requiring no card (requires.gpu "none") runs on a CPU pod sized by its jobs' cpu and RAM under the
 cap and created through pod.sh create-cpu (its real request body, against a fake curl), an interrupted job brings
 its outputs home and a resumable one is requeued to do the rest, a pod much slower than the median of the others (by pace, never by expected_s alone) is marked slow, moved off,
-replaced and its datacenter avoided (never while its set is short of stock), a GPU pod's driver CUDA version is read
+replaced and its datacenter avoided (never while its set is waiting for a pod), a GPU pod's driver CUDA version is read
 from nvidia-smi and one below min_cuda_version is deleted with its jobs kept queued and its datacenter avoided (even
-short of stock), a GPU create sends no allowedCudaVersions, a set short of stock fails only after
-max_wait_for_stock_minutes with no pod, a pod that did not boot is a miss of that same wait (its set's jobs stay queued,
+while its set waits for a pod), a GPU create sends no allowedCudaVersions, a set waiting for a pod fails only after
+max_wait_for_a_pod_minutes with no pod, a pod that did not boot is a miss of that same wait (its set's jobs stay queued,
 a create follows the backoff) while a job no pod can hold still fails at once, the deadline
 scales with expected_s and the pod's slowness, and podd imports nothing but the standard library.
 
@@ -122,7 +122,7 @@ def test_the_config_is_checked_and_a_requester_learns_whether_its_queue_is_watch
                                 "cpu_flavors": ["cpu3c"]}))
     config = podjobs.read_config(path)
     assert config["max_pods"] == {"gpu": 2, "cpu": 2} and config["max_price_per_hour"] == 0.60 and config["boot_seconds"] == 150, message
-    assert config["max_wait_for_stock_minutes"] == 60
+    assert config["max_wait_for_a_pod_minutes"] == 60
     assert config["min_cuda_version"] == "12.8"
     without_minimum = {key: value for key, value in config.items() if key != "min_cuda_version"}
     path.write_text(json.dumps(without_minimum))
@@ -133,6 +133,12 @@ def test_the_config_is_checked_and_a_requester_learns_whether_its_queue_is_watch
     assert "unknown key" not in retired, "the old key is named with what replaced it, not as an unknown key"
     path.write_text(json.dumps({**config, "allowed_cuda_versions": ["12.8"]}))
     raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "`allowed_cuda_versions` is replaced")
+    config_before_the_rename = {**{key: value for key, value in config.items() if key != "max_wait_for_a_pod_minutes"},
+                                "max_wait_for_stock_minutes": 60}     # the key as written before 2026-10-29
+    path.write_text(json.dumps(config_before_the_rename))
+    retired = raises(podjobs.JobContractError, lambda: podjobs.read_config(path),
+                     "`max_wait_for_stock_minutes` is replaced 2026-10-29 by `max_wait_for_a_pod_minutes`")
+    assert "unknown key" not in retired, "the old key is named with what replaced it, not as an unknown key"
     for not_a_version in (12.8, "12", "12.8.1", "v12.8", ["12.8"]):
         path.write_text(json.dumps({**config, "min_cuda_version": not_a_version}))
         raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "`min_cuda_version` must be")
@@ -259,7 +265,7 @@ def test_a_pool_whose_only_card_is_over_the_cap_opens_nothing_and_says_so():
         (stage / "in").write_text("x")
         podjobs.write_job(stage, a_job())
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS + [{"name": "NVIDIA L40S",
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS + [{"name": "NVIDIA L40S",
                                                                                   "memory_gb": 48}],
               "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
@@ -275,7 +281,7 @@ def test_a_pool_whose_only_card_is_over_the_cap_opens_nothing_and_says_so():
         assert said.getvalue().count("PRICE CAP") == 1, "said once per backoff, not every pass"
         assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir()), "they wait"
         pool.offers[1]["NVIDIA A40"]["price_per_hour"] = 0.59
-        next(iter(pool.short_of_stock.values())).retry_at_s = 0          # the backoff has passed
+        next(iter(pool.waiting_for_a_pod.values())).retry_at_s = 0          # the backoff has passed
         with contextlib.redirect_stdout(io.StringIO()) as said:
             pool.step()
     finally:
@@ -309,7 +315,7 @@ def test_a_looser_job_does_not_open_a_pod_while_a_pod_that_serves_it_boots():
     (stage / "in").write_text("x")
     podjobs.write_job(stage, a_job(requires={"image": IMAGE_A}))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     pool.pods["podd-g1"] = podd.Pod("podd-g1", secrets, a_job()["requires"], config)       # booting, stricter set
@@ -340,7 +346,7 @@ def test_a_job_requiring_an_image_no_running_pod_has_opens_a_pod_for_it():
     (stage / "in").write_text("x")
     podjobs.write_job(stage, a_job(requires={"image": IMAGE_B, "engine": "1.0", "solver_version": 1}))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     running_pod = podd.Pod("podd-g1", secrets, a_job()["requires"], config)
@@ -372,7 +378,7 @@ def test_a_pod_whose_facts_do_not_satisfy_its_set_fails_that_sets_jobs_and_is_ne
     (stage / "in").write_text("x")
     podjobs.write_job(stage, a_job(requires={"image": IMAGE_A, "engine": "2.0"}))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     mismatched = podd.Pod("podd-g1", secrets, {"image": IMAGE_A, "engine": "2.0"}, config)
@@ -396,9 +402,9 @@ def test_a_pod_whose_facts_do_not_satisfy_its_set_fails_that_sets_jobs_and_is_ne
     assert podjobs.stage_state(later) == podjobs.FAILED and not pool.pods, "the same set never opens another pod"
 
 
-# 4b. SHORT OF STOCK IS NOT A FAILURE (2026-10-14 10:01: six cpu "all" jobs FAILED because RunPod answered "no
+# 4b. NO POD YET IS NOT A FAILURE (2026-10-14 10:01: six cpu "all" jobs FAILED because RunPod answered "no
 # instances currently available" to four creates at once)
-def stock_pool(root, jobs=6, **config_changes):
+def no_pod_pool(root, jobs=6, **config_changes):
     queue_directory, secrets = root / "queue", root / "secrets"
     (secrets / podd.PODS_DIRECTORY_NAME).mkdir(parents=True)
     for n in range(jobs):
@@ -407,7 +413,7 @@ def stock_pool(root, jobs=6, **config_changes):
         (stage / "in").write_text("x")
         podjobs.write_job(stage, a_job(cpu="all", expected_s=75))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 8, "cpu": 8}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", **config_changes}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
@@ -422,7 +428,7 @@ def refused_for_stock(pool):
 
 def test_no_instances_leaves_the_jobs_queued_and_retries_one_pod_with_every_card_after_a_backoff():
     root = Path(tempfile.mkdtemp(prefix="podd-stock-"))
-    pool, queue_directory = stock_pool(root)
+    pool, queue_directory = no_pod_pool(root)
     saved = podd.Pod, podd.STATUS_FILE
     podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
     try:
@@ -436,12 +442,12 @@ def test_no_instances_leaves_the_jobs_queued_and_retries_one_pod_with_every_card
             pool.pods["podd-g8"] = earlier
             (pool.secrets / podd.PODS_DIRECTORY_NAME / "podd-g8.id").write_text("pod-a\n")
             pool.step()
-            assert pool.short_of_stock, "2026-10-15: a pod made BEFORE the miss does not end the wait"
+            assert pool.waiting_for_a_pod, "2026-10-15: a pod made BEFORE the miss does not end the wait"
             del pool.pods["podd-g8"]
             (pool.secrets / podd.PODS_DIRECTORY_NAME / "podd-g8.id").unlink()
             assert not pool.pods and said.getvalue().count("NO POD") == 1, "four misses of one attempt: said once"
             assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
-            wait = next(iter(pool.short_of_stock.values()))
+            wait = next(iter(pool.waiting_for_a_pod.values()))
             assert wait.misses == 1 and 55 < wait.retry_at_s - time.time() <= 60, wait.retry_at_s - time.time()
             pool.step()
             assert not pool.pods, "backing off: no create before retry_at"
@@ -455,21 +461,21 @@ def test_no_instances_leaves_the_jobs_queued_and_retries_one_pod_with_every_card
             refused_for_stock(pool)
             pool.step()
             assert wait.misses == 2 and 115 < wait.retry_at_s - time.time() <= 120, "the backoff doubles"
-            assert podd.stock_backoff_seconds(10) == podd.STOCK_RETRY_MAX_SECONDS
+            assert podd.no_pod_backoff_seconds(10) == podd.NO_POD_RETRY_MAX_SECONDS
             wait.retry_at_s = 0
             pool.step()
             probe = next(iter(pool.pods.values()))
             probe.created, probe.state, probe.facts = True, "ready", FACTS_A  # RunPod had one (create returns at ssh)
             pool.step()
-            assert not pool.short_of_stock, said.getvalue()[-400:]
+            assert not pool.waiting_for_a_pod, said.getvalue()[-400:]
         assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
     finally:
         podd.Pod, podd.STATUS_FILE = saved
 
 
-def test_a_set_short_of_stock_past_max_wait_fails_its_jobs_with_every_miss():
+def test_a_set_waiting_for_a_pod_past_max_wait_fails_its_jobs_with_every_miss():
     root = Path(tempfile.mkdtemp(prefix="podd-stock-"))
-    pool, queue_directory = stock_pool(root, jobs=2)
+    pool, queue_directory = no_pod_pool(root, jobs=2)
     saved = podd.Pod, podd.STATUS_FILE
     podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
     try:
@@ -478,22 +484,22 @@ def test_a_set_short_of_stock_past_max_wait_fails_its_jobs_with_every_miss():
             refused_for_stock(pool)
             pool.step()
             assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
-            next(iter(pool.short_of_stock.values())).podless_since_s -= 61 * 60
+            next(iter(pool.waiting_for_a_pod.values())).podless_since_s -= 61 * 60
             pool.step()
     finally:
         podd.Pod, podd.STATUS_FILE = saved
     for stage in queue_directory.iterdir():
         assert podjobs.stage_state(stage) == podjobs.FAILED
         reason = (stage / podjobs.FAILED).read_text()
-        assert "max_wait_for_stock_minutes" in reason and "no instances currently available" in reason, reason
+        assert "max_wait_for_a_pod_minutes" in reason and "no instances currently available" in reason, reason
         assert "NVIDIA RTX A5000, NVIDIA A40, NVIDIA RTX A4500" in reason, "the cards offered are in the story"
-    assert not pool.short_of_stock
+    assert not pool.waiting_for_a_pod
 
 
-def test_a_set_short_of_stock_never_fails_while_a_pod_of_it_runs_and_its_clock_starts_when_none_does():
+def test_a_set_waiting_for_a_pod_never_fails_while_a_pod_of_it_runs_and_its_clock_starts_when_none_does():
     """2026-10-22 00:15Z: 20 jobs FAILED "no pod for 60 min" while 3 pods of their set ran other chunks."""
     root = Path(tempfile.mkdtemp(prefix="podd-stock-"))
-    pool, queue_directory = stock_pool(root, jobs=2)
+    pool, queue_directory = no_pod_pool(root, jobs=2)
     saved = podd.Pod, podd.STATUS_FILE
     podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
     try:
@@ -501,42 +507,42 @@ def test_a_set_short_of_stock_never_fails_while_a_pod_of_it_runs_and_its_clock_s
             pool.step()
             refused_for_stock(pool)
             pool.step()
-            wait = next(iter(pool.short_of_stock.values()))
-            key = next(iter(pool.short_of_stock))
+            wait = next(iter(pool.waiting_for_a_pod.values()))
+            key = next(iter(pool.waiting_for_a_pod))
             working = podd.Pod("podd-g8", pool.secrets, json.loads(key), pool.config, attempt=0)
             working.created, working.state, working.facts = True, "ready", dict(FACTS_A, pod_name="podd-g8")
             pool.pods["podd-g8"] = working
             (pool.secrets / podd.PODS_DIRECTORY_NAME / "podd-g8.id").write_text("pod-a\n")
             busy = on_pod(pool, "other-chunk", "podd-g8", a_job(cpu="all", expected_s=75, progress="progress"), 1.0)
             wait.first_miss_s -= 3 * 3600
-            wait.podless_since_s -= 3 * 3600                    # hours short of stock: and a pod of the set runs
+            wait.podless_since_s -= 3 * 3600                    # hours waiting for a pod: and a pod of the set runs
             wait.retry_at_s = time.time() + 600
             pool.step()
             assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir()), \
                 said.getvalue()[-600:]
-            assert wait.podless_since_s is None and pool.short_of_stock, "the set has a pod: the clock is off"
-            status = json.loads((root / "PODS.json").read_text())["short_of_stock"]
+            assert wait.podless_since_s is None and pool.waiting_for_a_pod, "the set has a pod: the clock is off"
+            status = json.loads((root / "PODS.json").read_text())["waiting_for_a_pod"]
             assert status[key]["no_pod_since"] is None and status[key]["misses"] == 1, status
             del pool.running["/q/other-chunk"], pool.pods["podd-g8"]       # its last pod went
             (pool.secrets / podd.PODS_DIRECTORY_NAME / "podd-g8.id").unlink()
             pool.step()
             assert wait.podless_since_s is not None and "now with no pod" in said.getvalue()
             assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
-            assert json.loads((root / "PODS.json").read_text())["short_of_stock"][key]["fails_at"]
+            assert json.loads((root / "PODS.json").read_text())["waiting_for_a_pod"][key]["fails_at"]
             wait.podless_since_s -= 61 * 60
             pool.step()
     finally:
         podd.Pod, podd.STATUS_FILE = saved
     assert busy.stop is None
     assert all(podjobs.stage_state(stage) == podjobs.FAILED for stage in queue_directory.iterdir()), \
-        "no pod for max_wait_for_stock_minutes: the README's give-up"
+        "no pod for max_wait_for_a_pod_minutes: the README's give-up"
 
 
-def test_a_set_short_of_stock_avoids_no_datacenter_and_a_cpu_ban_never_reaches_a_gpu_create():
+def test_a_set_waiting_for_a_pod_avoids_no_datacenter_and_a_cpu_ban_never_reaches_a_gpu_create():
     """2026-10-21: 15 datacenters avoided (US-GA-2, the one with CPU stock, among them): RunPod refused every create,
     and the CPU pods' bans cut the GPU creates too."""
     root = Path(tempfile.mkdtemp(prefix="podd-stock-"))
-    pool, _ = stock_pool(root, jobs=1)
+    pool, _ = no_pod_pool(root, jobs=1)
     record = {"until_unix": time.time() + 3600, "until": "later", "why": "test", "pod": "podd-c1", "because": "slow"}
     pool.avoided_datacenter_records = {"cpu": {"US-GA-2": dict(record)}, "gpu": {"US-MD-1": dict(record)}}
     saved = podd.Pod, podd.STATUS_FILE
@@ -548,7 +554,7 @@ def test_a_set_short_of_stock_avoids_no_datacenter_and_a_cpu_ban_never_reaches_a
             assert first.create_command()[-1] == "US-MD-1", "a GPU create avoids the GPU bans only"
             refused_for_stock(pool)
             pool.step()
-            next(iter(pool.short_of_stock.values())).retry_at_s = 0
+            next(iter(pool.waiting_for_a_pod.values())).retry_at_s = 0
             pool.step()
             probe = next(iter(pool.pods.values()))
     finally:
@@ -557,7 +563,7 @@ def test_a_set_short_of_stock_avoids_no_datacenter_and_a_cpu_ban_never_reaches_a
     assert "does not avoid the slow datacenters US-MD-1" in said.getvalue(), said.getvalue()[-600:]
 
 
-def test_pod_sh_create_exiting_75_is_a_stock_miss_with_runpods_answer_not_a_boot_failure():
+def test_pod_sh_create_exiting_75_is_a_no_pod_miss_with_runpods_answer_not_a_boot_failure():
     root = Path(tempfile.mkdtemp(prefix="podd-stock-"))
     fake = root / "pod.sh"
     fake.write_text("#!/usr/bin/env bash\necho 'RunPod POST /pods -> HTTP 500: {\"error\":\"create pod: There are "
@@ -585,9 +591,9 @@ def did_not_boot(pool):
 def test_a_pod_that_did_not_boot_is_a_miss_its_set_waits_retries_after_the_backoff_and_fails_only_past_max_wait():
     """2026-10-29 16:42: podd-g1 did not boot (no public ssh port after 15 min); a pause of its own FAILED the set's
     jobs, and a job of that set queued 28 s later, with no create of its own. Now a boot failure is a miss, like a
-    stock miss: one wait, one backoff, one give-up (max_wait_for_stock_minutes, with every miss)."""
+    no-pod miss: one wait, one backoff, one give-up (max_wait_for_a_pod_minutes, with every miss)."""
     root = Path(tempfile.mkdtemp(prefix="podd-boot-"))
-    pool, queue_directory = stock_pool(root, jobs=2)
+    pool, queue_directory = no_pod_pool(root, jobs=2)
     saved = podd.Pod, podd.STATUS_FILE
     podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
     try:
@@ -599,7 +605,7 @@ def test_a_pod_that_did_not_boot_is_a_miss_its_set_waits_retries_after_the_backo
             assert not pool.pods and "did not boot" in said.getvalue(), said.getvalue()[-600:]
             assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir()), \
                 "a boot failure leaves its set's jobs queued"
-            wait = next(iter(pool.short_of_stock.values()))
+            wait = next(iter(pool.waiting_for_a_pod.values()))
             assert wait.misses == 1 and 55 < wait.retry_at_s - time.time() <= 60, "the stock backoff, no pause of its own"
             during = queue_directory / "queued-during-the-pause"            # 16:42:41, inside the pause
             during.mkdir()
@@ -623,14 +629,14 @@ def test_a_pod_that_did_not_boot_is_a_miss_its_set_waits_retries_after_the_backo
     for stage in queue_directory.iterdir():
         assert podjobs.stage_state(stage) == podjobs.FAILED, stage
         reason = (stage / podjobs.FAILED).read_text()
-        assert "max_wait_for_stock_minutes" in reason and reason.count("no public ssh port after 15 min") == 2, reason
+        assert "max_wait_for_a_pod_minutes" in reason and reason.count("no public ssh port after 15 min") == 2, reason
         assert "2 attempts" in reason, reason
-    assert not pool.short_of_stock
+    assert not pool.waiting_for_a_pod
 
 
 def test_a_job_no_pod_can_hold_still_fails_at_once_while_another_set_waits_after_a_boot_failure():
     root = Path(tempfile.mkdtemp(prefix="podd-boot-"))
-    pool, queue_directory = stock_pool(root, jobs=1)
+    pool, queue_directory = no_pod_pool(root, jobs=1)
     saved = podd.Pod, podd.STATUS_FILE
     podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
     try:
@@ -638,7 +644,7 @@ def test_a_job_no_pod_can_hold_still_fails_at_once_while_another_set_waits_after
             pool.step()
             did_not_boot(pool)
             pool.step()
-            assert pool.short_of_stock and not pool.pods, said.getvalue()[-600:]
+            assert pool.waiting_for_a_pod and not pool.pods, said.getvalue()[-600:]
             serving_b = podd.Pod("podd-g8", pool.secrets, {"image": IMAGE_B}, pool.config, attempt=0)
             serving_b.created, serving_b.state = True, "ready"
             serving_b.facts = dict(FACTS_A, pod_name="podd-g8", image=IMAGE_B)
@@ -736,9 +742,9 @@ def test_a_gpu_pod_below_min_cuda_version_is_an_old_driver_after_its_boot_and_on
             assert "CUDA 12.4 < min_cuda_version 12.8" in pod.problem and "US-TX-3" in pod.problem, pod.problem
 
 
-def test_a_pod_on_an_old_driver_is_deleted_its_jobs_stay_queued_and_its_datacenter_is_avoided_even_short_of_stock():
+def test_a_pod_on_an_old_driver_is_deleted_its_jobs_stay_queued_and_its_datacenter_is_avoided_even_waiting_for_a_pod():
     root = Path(tempfile.mkdtemp(prefix="podd-driver-"))
-    pool, queue_directory = stock_pool(root, jobs=1)
+    pool, queue_directory = no_pod_pool(root, jobs=1)
     saved = podd.Pod, podd.STATUS_FILE, podd.POD_SCRIPT
     fake = root / "pod.sh"
     fake.write_text("#!/usr/bin/env bash\nexit 0\n")
@@ -755,7 +761,7 @@ def test_a_pod_on_an_old_driver_is_deleted_its_jobs_stay_queued_and_its_datacent
             assert not pool.pods and f"{old.name}: deleting pod pod-old" in said.getvalue(), said.getvalue()[-800:]
             assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir()), \
                 "its jobs stay queued"
-            wait = next(iter(pool.short_of_stock.values()))
+            wait = next(iter(pool.waiting_for_a_pod.values()))
             assert wait.misses == 1 and "CUDA 12.4 < min_cuda_version 12.8" in wait.story[-1], wait.story
             recorded = json.loads(podd.AVOIDED_DATACENTERS_FILE.read_text())
             assert recorded["gpu"]["US-TX-3"]["because"] == "old driver", recorded
@@ -766,7 +772,7 @@ def test_a_pod_on_an_old_driver_is_deleted_its_jobs_stay_queued_and_its_datacent
     finally:
         podd.Pod, podd.STATUS_FILE, podd.POD_SCRIPT = saved
     assert probe.avoid_datacenters == ["US-TX-3"] and probe.create_command()[-1] == "US-TX-3", \
-        "short of stock still avoids an old driver's datacenter: such a pod runs nothing"
+        "waiting for a pod still avoids an old driver's datacenter: such a pod runs nothing"
     assert podd.read_avoided_datacenters() == recorded, "kept across a restart"
     podd.AVOIDED_DATACENTERS_FILE.unlink()
 
@@ -929,7 +935,7 @@ def test_a_failed_delete_is_retried_and_does_not_stop_podd():
                     "echo 'RunPod DELETE /pods/pod-a -> HTTP 500: unexpected end of JSON input' >&2\nexit $status\n")
     fake.chmod(0o755)
     config = {"queue_directories": [str(root / "queue")], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c"]}
     pool = podd.Pool(secrets, config)
     pod = podd.Pod("podd-g1", secrets, a_job()["requires"], config)
@@ -1031,7 +1037,7 @@ def test_a_set_requiring_no_card_opens_a_cpu_pod_through_create_cpu():
         (stage / "in").write_text("x")
         podjobs.write_job(stage, a_cpu_job(expected_s=3000))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c", "cpu5c", "cpu3g"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))   # never pod.sh avail-cpu in a test
@@ -1059,7 +1065,7 @@ def test_gpu_and_cpu_pods_are_capped_apart():
             (stage / "in").write_text("x")
             podjobs.write_job(stage, job)
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 3, "cpu": 2}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c", "cpu5c", "cpu3g"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))
@@ -1335,7 +1341,7 @@ def slow_pool(root, pods=(("podd-c1", "EU-RO-1"), ("podd-c2", "US-MD-1"))):
     (secrets / podd.PODS_DIRECTORY_NAME).mkdir(parents=True)
     queue_directory.mkdir(parents=True)
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 2, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))
@@ -1438,7 +1444,7 @@ def test_a_pod_in_the_normal_spread_is_not_slow_against_the_fastest_one():
     assert all(pod.state == "ready" for pod in pool.pods.values()) and "IS SLOW" not in said, said
 
 
-def test_a_lone_pod_is_never_slow_by_expected_s_and_a_set_short_of_stock_keeps_its_slow_pod():
+def test_a_lone_pod_is_never_slow_by_expected_s_and_a_set_waiting_for_a_pod_keeps_its_slow_pod():
     """2026-10-21 10:03: US-CA-2 banned at 2.49x a client's expected_s, which was 3x off; 2026-10-21 23:15-02:33:
     pods stopped as slow while RunPod had no stock to replace them."""
     root = Path(tempfile.mkdtemp(prefix="podd-slow-"))
@@ -1451,7 +1457,7 @@ def test_a_lone_pod_is_never_slow_by_expected_s_and_a_set_short_of_stock_keeps_i
     on_pod(pool, "c0", "podd-c1", a_resumable_cpu_job(), 7.8)
     on_pod(pool, "c3", "podd-c3", a_resumable_cpu_job(), 8.9)
     slow_job = on_pod(pool, "c1", "podd-c2", a_resumable_cpu_job(), 17.0)
-    pool.short_of_stock[podd.requirement_key(CPU_REQUIRES)] = podd.StockWait(time.time())
+    pool.waiting_for_a_pod[podd.requirement_key(CPU_REQUIRES)] = podd.NoPodWait(time.time())
     said = judged(pool, root)
     assert pool.pods["podd-c2"].state == "ready" and slow_job.stop is None, "nothing would replace it: kept"
     assert said.count("KEPT") == 1 and not podd.AVOIDED_DATACENTERS_FILE.exists(), said

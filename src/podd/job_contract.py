@@ -93,14 +93,17 @@ RETIRED_CONFIG_KEYS = {
     "allowed_cuda_versions": "replaced 2026-10-29 by `min_cuda_version` (e.g. \"12.8\"): the lowest driver CUDA "
                              "version your images run. RunPod's allowedCudaVersions enum stops at 13.0, so the list "
                              "shut out every host with a newer driver; podd now creates on any host and measures the "
-                             "driver on the pod"}
+                             "driver on the pod",
+    "max_wait_for_stock_minutes": "replaced 2026-10-29 by `max_wait_for_a_pod_minutes` (same meaning, same default "
+                                  "60): the wait covers every way a set gets no pod it can run on (no stock, no card "
+                                  "under the price cap, an old driver, a pod that did not boot), not stock alone"}
 POD_KINDS = ("gpu", "cpu")                      # max_pods caps each kind apart; a set requiring gpu "none" is cpu
 CPU_FLAVORS = ("cpu3c", "cpu3g", "cpu3m", "cpu5c", "cpu5g", "cpu5m")   # PodCreateInput.cpuFlavorIds' enum
                                     # (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json)
 CONFIG_DEFAULTS = {"boot_seconds": 150,           # create -> ready, measured 97-155 s (2026-10-13..14): podd opens
                                                   # another pod only when the backlog would outlast a boot
-                   "max_wait_for_stock_minutes": 60}  # a set RunPod has no pod for this long FAILS its jobs (podd.py
-                                                      # stock_miss): short of stock is waited out, never forever
+                   "max_wait_for_a_pod_minutes": 60}  # a set RunPod has no pod for this long FAILS its jobs (podd.py
+                                                      # no_pod_miss): no pod yet is waited out, never forever
 
 
 class JobContractError(ValueError):
@@ -299,7 +302,7 @@ def read_config(path=None):
             problems.append(f"`max_pods` must be {{\"gpu\": n, \"cpu\": n}}, positive integers: GPU and CPU pods are "
                             f"capped apart (2026-10-15: hour-long CPU jobs held all 8 shared slots and starved a "
                             f"GPU sweep); got {caps!r}")
-        for key in ("idle_minutes", "max_price_per_hour", "boot_seconds", "max_wait_for_stock_minutes"):
+        for key in ("idle_minutes", "max_price_per_hour", "boot_seconds", "max_wait_for_a_pod_minutes"):
             if not (is_number(config[key]) and config[key] > 0):
                 problems.append(f"`{key}` must be a positive number")
         if not (isinstance(config["cards"], list) and config["cards"] and all(
