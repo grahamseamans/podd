@@ -10,12 +10,14 @@ pod by what it requires. architecture/README.md is the pattern.
 THE CONFIG: ~/.config/podd/config.json ($PODD_CONFIG overrides; job_contract.read_config checks every key):
 queue_directories (absolute paths; each subdirectory is a stage), max_pods ({"gpu": n, "cpu": n}: GPU pods and CPU
 pods are capped apart, 2026-10-15), idle_minutes, max_price_per_hour, cards (the cards a pod may
-be, each {name, memory_gb}), allowed_cuda_versions (host drivers a pod may run on), cpu_flavors, and, with defaults,
+be, each {name, memory_gb}), min_cuda_version (the lowest driver CUDA version a GPU pod may have), cpu_flavors, and,
+with defaults,
 boot_seconds (150) and max_wait_for_stock_minutes (60).
 
 A POD'S FACTS, read ONCE when it boots: /etc/podd-facts.json (what its image declares: README.md "Images";
 a pod without it is refused), the image tag podd launched it from, nvidia-smi's card name and memory (decimal GB; a
-pod without nvidia-smi has gpu null and gpu_memory_gb 0: a CPU pod),
+pod without nvidia-smi has gpu null, gpu_memory_gb 0 and cuda_version null: a CPU pod) and the driver's CUDA version
+(cuda_version, nvidia-smi's "CUDA Version: X.Y"),
 the cgroup CPU quota (else its cpuset's CPU count), the RAM (cgroup memory.max, else MemTotal, at most RunPod's
 memoryInGb for the pod: a RunPod
 container has no memory limit and sees the host's), and pod.sh's price, datacenter and container disk (RunPod's
@@ -50,8 +52,9 @@ per job is the lowest; create is offered every flavor that holds the same jobs a
 first, cheapest first. A booting CPU pod's capacity is that plan. Facts, packing, idling and stock are the GPU pods'.
 SHORT OF STOCK IS NOT A FAILURE. pod.sh create exits POD_SH_NO_STOCK_EXIT when RunPod has no instance of any card
 offered; podd says so loudly once per attempt, the set's jobs stay JOB, and its next create waits
-stock_backoff_seconds (60 s doubling to 10 min) and is ONE pod (a probe, not a burst), avoiding no datacenter, until a
-create succeeds. No card under the cap counts the same way. A set short of stock that has had NO pod (none ready or
+stock_backoff_seconds (60 s doubling to 10 min) and is ONE pod (a probe, not a burst), avoiding no slow datacenter,
+until a create succeeds. No card under the cap counts the same way, and so does a pod on an old driver. A set short
+of stock that has had NO pod (none ready or
 slow serving it, no job of it running) for more than max_wait_for_stock_minutes FAILS its waiting jobs with every miss
 (time, cards offered, RunPod's answer); while a pod serves it, they wait. The waits are in the status file. A pod whose facts do not
 satisfy the set it was opened for is deleted and the set's waiting jobs FAIL with the mismatch, as do later jobs of
@@ -61,8 +64,16 @@ podd-c<max_pods.cpu> (pod.sh's name: its id file, lease,
 alias runpod-<name>).
 
 EACH POD'S LIFE. Booting: `pod.sh create` in its own thread (never in a datacenter recorded slow for its kind, unless
-its set is short of stock: below), then podd
-ships podd-run.sh and reads the facts. Ready: takes jobs. SLOW or BROKEN: takes no more, deleted once empty. Deleted
+its set is short of stock: below; never in one recorded for an old driver), then podd
+ships podd-run.sh and reads the facts. OLD DRIVER (2026-10-29): a GPU create asks RunPod for any host (RunPod's
+allowedCudaVersions enum stops at 13.0, so a list of versions shut out every newer driver, and the only stock under the
+cap was on such hosts); a GPU pod whose measured cuda_version is below min_cuda_version (compared as integer tuples)
+is deleted at once, its datacenter avoided by GPU creates for OLD_DRIVER_DATACENTER_HOURS even while its set is short
+of stock (an old-driver pod runs nothing, unlike a slow one), and the miss counts as a stock miss: the jobs stay JOB,
+the next create backs off, and a set with no pod for max_wait_for_stock_minutes FAILS (Pool.reject_old_driver).
+An image that refuses the old driver at container start (NVIDIA_REQUIRE_CUDA: "OCI runtime create failed") never
+opens ssh: pod.sh create gives up after 15 min and exits 1, which is a boot failure like any other. Ready: takes jobs.
+SLOW or BROKEN: takes no more, deleted once empty. Deleted
 after idle_minutes with no job, when a job on it failed for a reason of the pod's own (ssh, rsync: it is BROKEN), once
 SLOW and empty, or when podd stops (a booting create is stopped, its pod deleted). pod.sh's watchdog
 is the backstop for a podd that died (MAX_POD_HOURS after its lease was last touched; podd touches the lease of every
@@ -94,7 +105,7 @@ pod; reference_pace), else not at all: a pod running N jobs at once is not slow 
 scales a lone job's deadline. At SLOW_FACTOR or more its pod is SLOW (mark_slow) -- unless its set is short of stock
 (nothing would replace it: kept, said once): it takes no more jobs and serves no set (the opening rule replaces it),
 its resumable jobs are stopped and requeued when the move saves more than a boot (worth_moving; each at most
-MAX_SLOW_STOPS times), its others run on under the scaled deadline, and its datacenter goes in SLOW_DATACENTERS_FILE
+MAX_SLOW_STOPS times), its others run on under the scaled deadline, and its datacenter goes in AVOIDED_DATACENTERS_FILE
 under its kind: that kind's creates avoid it for SLOW_DATACENTER_HOURS. A pod's slowness (the largest its jobs
 measured) scales its jobs' deadlines. All said loudly.
 
@@ -111,6 +122,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -150,6 +162,9 @@ MIN_SECONDS_TO_JUDGE = 60
 MIN_REFERENCE_PODS = 2               # other pods with a measured pace at the same load before a pod is judged
 REFERENCE_MAX_AGE_SECONDS = 3600     # a pace measured longer ago is no reference (a client may revise its expected_s)
 SLOW_DATACENTER_HOURS = 12           # a datacenter a slow pod of a kind was in: podd's creates of that kind avoid it
+OLD_DRIVER_DATACENTER_HOURS = 12     # a datacenter a GPU pod below min_cuda_version was in: GPU creates avoid it (a
+                                     # host's driver, not the datacenter's: a guess that its neighbours are alike)
+AVOIDED_BECAUSE = ("slow", "old driver")   # why a datacenter is avoided (AVOIDED_DATACENTERS_FILE's `because`)
 MAX_ATTEMPTS = 4                     # a resumable job's attempts (the first included); the last one FAILS, never loops
 MAX_SLOW_STOPS = 2                   # a job is moved off a slow pod at most this often (then it runs on where it is:
                                      # its expected_s may be optimistic, and every pod would look slow)
@@ -179,8 +194,10 @@ SSH_FAILURES_ALLOWED = 3             # consecutive failed exit polls that fail t
 SSH_COMMAND_TIMEOUT_S = 600          # one ssh / rsync; a hung connection is a failure, never a hang
 
 STATUS_FILE = Path.home() / ".local" / "state" / "podd" / "PODS.json"
-# {datacenter: {"until_unix", "until", "why", "pod"}}: the datacenters a slow pod was in, kept across restarts
-SLOW_DATACENTERS_FILE = STATUS_FILE.parent / "slow-datacenters.json"
+# {kind: {datacenter: {"until_unix", "until", "why", "pod", "because"}}}: the datacenters podd's creates avoid,
+# kept across restarts; because "slow" (a slow pod was there: mark_slow) or "old driver" (a host whose driver was
+# below min_cuda_version: Pool.reject_old_driver)
+AVOIDED_DATACENTERS_FILE = STATUS_FILE.parent / "avoided-datacenters.json"
 POD_SCRIPT = PACKAGE_DIRECTORY / "pod.sh"
 SECRETS_SCRIPT = PACKAGE_DIRECTORY / "secrets.sh"
 PODS_DIRECTORY_NAME = "runpod_pods"                  # pod.sh's PODS_DIRECTORY, in the secrets directory
@@ -189,9 +206,14 @@ POD_JOBS = "/workspace/jobs"
 RUNNER_SCRIPT = PACKAGE_DIRECTORY / "podd-run.sh"
 RUNNER_ON_THE_POD = "/workspace/podd/podd-run.sh"    # shipped once per pod (Pod.boot)
 FACTS_ON_THE_POD = "/etc/podd-facts.json"           # what the image declares (README.md "Images")
-# the card, or "none" when the pod has no nvidia-smi (a CPU pod: RunPod's container runtime injects it only with a card)
+# the card, then nvidia-smi's own summary for the driver's CUDA version, or "none" when the pod has no nvidia-smi (a
+# CPU pod: RunPod's container runtime injects it only with a card). The summary's "CUDA Version: X.Y" is the CUDA
+# driver API version, cuDriverGetVersion()'s (NVIDIA's cuda-python, cuda/pathfinder/_utils/driver_info.py: "the version
+# shown as CUDA Version in nvidia-smi ... reported by cuDriverGetVersion()", "not the graphics driver release shown as
+# Driver Version"): the newest CUDA runtime the host's driver runs, the number an image's CUDA needs, read without a
+# driver-to-CUDA table. --query-gpu has no field for it, so the summary's text is parsed (cuda_version_of).
 GPU_ON_THE_POD = ("if command -v nvidia-smi >/dev/null; then nvidia-smi --query-gpu=name,memory.total "
-                  "--format=csv,noheader,nounits; else echo none; fi")
+                  "--format=csv,noheader,nounits && nvidia-smi; else echo none; fi")
 # the CPU the container may use: cgroup v2's cpu.max ("<quota> <period>", or "max <period>": no quota), its cpuset
 # (a RunPod CPU pod has no quota and a cpuset of hyperthreads: "5,101" on a 2-vCPU cpu3g, 2026-10-15, where nproc said
 # 8, the image's OMP_NUM_THREADS), and nproc without the OpenMP variables it obeys (the last resort)
@@ -200,7 +222,7 @@ CPU_ON_THE_POD = ("cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo none; "
                   "env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc")
 # the RAM the container may use: cgroup v2's memory.max (bytes, or "max": no limit -> MemTotal of /proc/meminfo, kB)
 RAM_ON_THE_POD = "cat /sys/fs/cgroup/memory.max 2>/dev/null || echo none; grep MemTotal /proc/meminfo"
-MEASURED_FACTS = ("pod_name", "pod_id", "image", "gpu", "gpu_memory_gb", "cpu", "ram_gb", "disk_gb",
+MEASURED_FACTS = ("pod_name", "pod_id", "image", "gpu", "gpu_memory_gb", "cuda_version", "cpu", "ram_gb", "disk_gb",
                   "datacenter", "cost_per_hr", "ready_at")
 
 
@@ -573,9 +595,10 @@ def facts_of_pod(image_facts_text, gpu_text, cpu_text, ram_text, image, session,
     if shadowing:
         raise PodError(f"(╯°□°)╯ {FACTS_ON_THE_POD} on {name} declares {shadowing}, which podd measures itself")
     if gpu_text.strip() == "none":                # no nvidia-smi: a CPU pod
-        gpu_name, gpu_memory_mib = None, "0"
+        gpu_name, gpu_memory_mib, cuda_version = None, "0", None
     else:
         gpu_name, gpu_memory_mib = [part.strip() for part in gpu_text.strip().splitlines()[0].rsplit(",", 1)]
+        cuda_version = cuda_version_of(gpu_text, name)
     cpu = cpu_of(cpu_text)
     ram_lines = ram_text.strip().splitlines()
     unlimited = ram_lines[0].strip() in ("max", "none")
@@ -584,9 +607,35 @@ def facts_of_pod(image_facts_text, gpu_text, cpu_text, ram_text, image, session,
     if session.get("memory_gb"):                  # RunPod's Pod.memoryInGb: a RunPod container has no memory limit
         ram_gb = min(ram_gb, session["memory_gb"])  # and sees the host's RAM (540 GB on an A40 host, 2026-10-14)
     return {**image_facts, "pod_name": name, "pod_id": pod_id, "image": image, "gpu": gpu_name,
-            "gpu_memory_gb": round(int(gpu_memory_mib) * 1048576 / 1e9, 2), "cpu": cpu, "ram_gb": ram_gb,
+            "gpu_memory_gb": round(int(gpu_memory_mib) * 1048576 / 1e9, 2), "cuda_version": cuda_version,
+            "cpu": cpu, "ram_gb": ram_gb,
             "disk_gb": session.get("container_disk_gb"), "datacenter": session.get("datacenter"),
             "cost_per_hr": session.get("cost_per_hr"), "ready_at": now_text}
+
+
+def cuda_version_of(nvidia_smi_text, name):
+    """nvidia-smi's "CUDA Version: X.Y" (its summary's header, or `-q`'s "CUDA Version : X.Y") -> "X.Y"; none on a
+    pod with a card is podd's failure to measure, said loudly (PodError)."""
+    found = re.search(r"CUDA Version\s*:\s*(\d+\.\d+)", nvidia_smi_text)
+    if found is None:
+        raise PodError(f"(╯°□°)╯ nvidia-smi on {name} printed no \"CUDA Version: X.Y\": podd cannot tell whether the "
+                       f"host's driver runs the image (min_cuda_version). It printed: {nvidia_smi_text[:600]!r}")
+    return found.group(1)
+
+
+def cuda_version_tuple(version_text):
+    """"13.10" -> (13, 10): versions compare as integers, so 13.10 > 13.2 (as text it would not)."""
+    return tuple(int(part) for part in version_text.split("."))
+
+
+def old_driver(facts, min_cuda_version):
+    """Why this GPU pod's driver is too old for the account's images (None when it is not, or the pod has no card)."""
+    if facts.get("gpu") is None:
+        return None
+    if cuda_version_tuple(facts["cuda_version"]) >= cuda_version_tuple(min_cuda_version):
+        return None
+    return (f"OLD DRIVER: CUDA {facts['cuda_version']} < min_cuda_version {min_cuda_version} on {facts.get('gpu')} in "
+            f"{facts.get('datacenter')}")
 
 
 def cpu_of(cpu_text):
@@ -661,9 +710,9 @@ def transfer(command):
 
 
 class Pod:
-    """One pod of the pool, by its name. state: booting | ready | slow | broken | no stock | boot failed | mismatch |
-    gone. slowness: its jobs' measured seconds per unit over the reference, the largest seen (1 until measured): what
-    its jobs' deadlines scale by."""
+    """One pod of the pool, by its name. state: booting | ready | slow | broken | no stock | boot failed | old driver |
+    mismatch | gone. slowness: its jobs' measured seconds per unit over the reference, the largest seen (1 until
+    measured): what its jobs' deadlines scale by."""
 
     def __init__(self, name, secrets, requires=None, config=None, cards=(), attempt=0, vcpu=None,
                  avoid_datacenters=()):
@@ -713,11 +762,11 @@ class Pod:
             return [str(POD_SCRIPT), "create-cpu", self.name, image, ",".join(self.cards), str(self.vcpu),
                     str(container_disk_gb(self.requires)), *avoid]
         return [str(POD_SCRIPT), "create", self.name, image, ",".join(self.cards),
-                str(math.ceil(self.requires.get("cpu_min", 1))), ",".join(self.config["allowed_cuda_versions"]),
-                str(container_disk_gb(self.requires)), *avoid]
+                str(math.ceil(self.requires.get("cpu_min", 1))), str(container_disk_gb(self.requires)), *avoid]
 
     def boot(self):
-        """pod.sh create, ship podd-run.sh, read the facts once; ready, mismatch, or boot failed, with the reason."""
+        """pod.sh create, ship podd-run.sh, read the facts once; ready, old driver, mismatch, or boot failed, with the
+        reason."""
         command = self.create_command()
         say(f"{self.name}: {' '.join(command[1:])} (＾_＾)")
         started_s = time.time()
@@ -747,6 +796,10 @@ class Pod:
             traceback.print_exc()
             self.problem = f"{type(error).__name__}: {error}"
             self.state = "boot failed"
+            return
+        too_old = old_driver(self.facts, self.config["min_cuda_version"])
+        if too_old:
+            self.problem, self.state = too_old, "old driver"
             return
         unmet = unmet_requirements(self.requires, self.facts)
         if unmet:
@@ -1042,7 +1095,8 @@ class Pool:
         self.missing_queues_said = set()
         self.last_status = None
         self.paces_by_command = {}         # command -> {attempt key: (pace, load, pod id, measured at)}: judge_speeds
-        self.slow_datacenters = read_slow_datacenters()   # kind -> datacenter -> {until_unix, until, why, pod}
+        self.avoided_datacenter_records = read_avoided_datacenters()   # kind -> datacenter -> {until_unix, until,
+                                                                       # why, pod, because}
         self.slow_kept_said = set()        # pods measured slow but kept (their set is short of stock): said once
         self.last_capacity = None          # the capacity of the last GPU pod podd read: a booting GPU pod's guess
         self.offers = None                 # (time, pod.sh avail's JSON) of the cards the config lists
@@ -1094,16 +1148,46 @@ class Pool:
             del self.undeleted[name]
             self.forget(pod, f"retrying the failed delete ({reason})")
 
-    def avoided_datacenters(self, kind):
-        """The datacenters a slow pod of this kind was in within SLOW_DATACENTER_HOURS (the expired ones are said and
-        dropped). A CPU host's slowness says nothing of a GPU host's in the same datacenter, and the reverse."""
-        recorded = self.slow_datacenters.get(kind, {})
+    def avoided_datacenters(self, kind, short_of_stock=False):
+        """The datacenters this kind's creates avoid now (the expired ones are said and dropped): a slow pod's (not
+        while the set is short of stock: a slow pod is better than none) and an old driver's (always: such a pod runs
+        nothing). A CPU host's slowness says nothing of a GPU host's in the same datacenter, and the reverse."""
+        recorded = self.avoided_datacenter_records.get(kind, {})
         for datacenter, record in list(recorded.items()):
             if record["until_unix"] <= time.time():
                 del recorded[datacenter]
-                say(f"{datacenter}: no longer avoided for {kind} pods (slow until {record['until']}: {record['why']})")
-                write_slow_datacenters(self.slow_datacenters)
-        return sorted(recorded)
+                say(f"{datacenter}: no longer avoided for {kind} pods ({record['because']} until {record['until']}: "
+                    f"{record['why']})")
+                write_avoided_datacenters(self.avoided_datacenter_records)
+        return sorted(datacenter for datacenter, record in recorded.items()
+                      if not (short_of_stock and record["because"] == "slow"))
+
+    def avoid_datacenter(self, pod, because, why, hours):
+        """Record the pod's datacenter as avoided by creates of its kind for `hours` (AVOIDED_DATACENTERS_FILE); said
+        loudly, as is a pod pod.sh recorded no datacenter for."""
+        datacenter, kind = (pod.facts or {}).get("datacenter"), pod_kind(pod.requires)
+        if not datacenter:
+            say(f"(╯°□°)╯ {pod.name}: pod.sh recorded no datacenter for it, so podd cannot avoid where it was "
+                f"({because})")
+            return
+        until_unix = time.time() + hours * 3600
+        self.avoided_datacenter_records.setdefault(kind, {})[datacenter] = {
+            "until_unix": until_unix, "pod": pod.name, "why": why, "because": because,
+            "until": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(until_unix))}
+        write_avoided_datacenters(self.avoided_datacenter_records)
+        say(f"(╯°□°)╯ {datacenter} is recorded {because.upper()} for {kind} pods: podd's {kind} creates avoid it for "
+            f"{hours} h{', unless RunPod has no stock elsewhere' if because == 'slow' else ''} "
+            f"({AVOIDED_DATACENTERS_FILE})")
+
+    def reject_old_driver(self, pod):
+        """A GPU pod whose driver is below min_cuda_version (Pod.boot: old_driver): deleted at once, its datacenter
+        avoided for OLD_DRIVER_DATACENTER_HOURS, and a stock miss for its set (RunPod gave no host the images run on):
+        the jobs stay JOB and the next create backs off. All said loudly."""
+        key = requirement_key(pod.requires)
+        say(f"(╯°□°)╯ {pod.name} (pod {pod.facts.get('pod_id')}) {pod.problem}: deleting it; its jobs stay queued")
+        self.avoid_datacenter(pod, "old driver", pod.problem, OLD_DRIVER_DATACENTER_HOURS)
+        self.forget(pod, pod.problem)
+        self.stock_miss(key, pod.attempt, f"{pod.name} landed on a host it cannot use: {pod.problem}")
 
     def count_loads(self):
         """Every running job's load: how many jobs its pod runs now, and the most during it (its deadline's factor)."""
@@ -1168,19 +1252,9 @@ class Pool:
         Its datacenter is avoided by creates of its kind for SLOW_DATACENTER_HOURS. All said loudly."""
         pod.state, pod.problem = "slow", f"SLOW: {why}"
         self.slow_kept_said.discard(pod.name)
-        datacenter, kind = (pod.facts or {}).get("datacenter"), pod_kind(pod.requires)
-        say(f"(╯°□°)╯ {pod.name} ({datacenter}, {(pod.facts or {}).get('gpu') or 'CPU'}) IS SLOW: {why}. It takes no "
-            f"more jobs and goes once empty")
-        if datacenter:
-            until_unix = time.time() + SLOW_DATACENTER_HOURS * 3600
-            self.slow_datacenters.setdefault(kind, {})[datacenter] = {
-                "until_unix": until_unix, "pod": pod.name, "why": why,
-                "until": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(until_unix))}
-            write_slow_datacenters(self.slow_datacenters)
-            say(f"(╯°□°)╯ {datacenter} is recorded SLOW for {kind} pods: podd's {kind} creates avoid it for "
-                f"{SLOW_DATACENTER_HOURS} h, unless RunPod has no stock elsewhere ({SLOW_DATACENTERS_FILE})")
-        else:
-            say(f"(╯°□°)╯ {pod.name}: pod.sh recorded no datacenter for it, so podd cannot avoid where it was")
+        say(f"(╯°□°)╯ {pod.name} ({(pod.facts or {}).get('datacenter')}, {(pod.facts or {}).get('gpu') or 'CPU'}) IS "
+            f"SLOW: {why}. It takes no more jobs and goes once empty")
+        self.avoid_datacenter(pod, "slow", why, SLOW_DATACENTER_HOURS)
         for running in self.jobs_on(pod.name):
             label = running.job.get("label") or running.key
             moved = sum(1 for attempt in running.job.get("attempts") or [] if attempt.get("stopped_for") == "slow pod")
@@ -1377,16 +1451,16 @@ class Pool:
                 f"pod(s) up or booting > boot_seconds {self.config['boot_seconds']}: opening {wanted}{staggered} "
                 f"(drain then {drain_seconds(backlog, serving + [(guess, True)] * wanted):.0f} s)")
             self.attempts[key] = self.attempts.get(key, 0) + 1
-            avoided = self.avoided_datacenters(kind)
-            if avoided and wait:                         # avoiding a slow datacenter must never cost a pod
-                say(f"(・_・;) {key} is short of stock: its create avoids no datacenter (not the slow ones "
-                    f"{', '.join(avoided)}): a slow pod is better than none")
-                avoided = []
+            avoided = self.avoided_datacenters(kind, short_of_stock=bool(wait))
+            forgiven = sorted(set(self.avoided_datacenters(kind)) - set(avoided))
+            if forgiven:                                 # avoiding a slow datacenter must never cost a pod
+                say(f"(・_・;) {key} is short of stock: its create does not avoid the slow datacenters "
+                    f"{', '.join(forgiven)}: a slow pod is better than none")
             for _ in range(wanted):
                 pod = Pod(self.free_name(kind), self.secrets, requires, self.config, cards, self.attempts[key],
                           plan["vcpu"] if plan else None, avoided)
                 say(f"{pod.name}: opening a pod for requirement set {key} (attempt {self.attempts[key]}), offering "
-                    f"{offered}{'; avoiding the slow datacenters ' + ', '.join(avoided) if avoided else ''}")
+                    f"{offered}{'; avoiding the datacenters ' + ', '.join(avoided) if avoided else ''}")
                 self.pods[pod.name] = pod
                 pod.start_booting()
 
@@ -1399,9 +1473,9 @@ class Pool:
         waiting = self.waiting_jobs()
         for pod in list(self.pods.values()):
             key = requirement_key(pod.requires)
-            if (pod.created and key in self.short_of_stock    # booting or ready: pod.sh create returns at ssh
-                    and pod.attempt > self.short_of_stock[key].counted_attempt):   # made AFTER the miss (2026-10-15:
-                wait = self.short_of_stock.pop(key)    # a pod made before it cleared the wait every pass: no backoff)
+            if (pod.state == "ready" and key in self.short_of_stock     # a pod the set can use (not one on an old
+                    and pod.attempt > self.short_of_stock[key].counted_attempt):   # driver), made AFTER the miss
+                wait = self.short_of_stock.pop(key)    # (2026-10-15: a pod made before it cleared the wait every pass)
                 say(f"{pod.name}: RunPod gave {key} a pod after {wait.misses} stock miss(es), "
                     f"{(time.time() - wait.first_miss_s) / 60:.1f} min")
             if pod.state == "no stock":
@@ -1418,6 +1492,9 @@ class Pool:
                 say(f"(╯°□°)╯ {pod.name} did not boot: {pod.problem}; that set's next create waits "
                     f"{CREATE_RETRY_SECONDS} s")
                 self.forget(pod, "it failed its create or its read")
+            elif pod.state == "old driver":
+                self.pods.pop(pod.name)
+                self.reject_old_driver(pod)
             elif pod.state == "mismatch":
                 self.pods.pop(pod.name)
                 self.mismatched[key] = f"{pod.name} ({pod.facts.get('image')}) {pod.problem}"
@@ -1490,7 +1567,7 @@ class Pool:
                                             "slowness": running.slowness, "load": running.load}
                                     for stage, running in self.running.items() if running.pod_name == pod.name}}
                       for pod in sorted(self.pods.values(), key=lambda pod: pod.name)],
-                  "slow_datacenters": self.slow_datacenters,
+                  "avoided_datacenters": self.avoided_datacenter_records,
                   "short_of_stock": {key: {
                       "misses": wait.misses, "since": utc_text(wait.first_miss_s),
                       "no_pod_since": utc_text(wait.podless_since_s) if wait.podless_since_s is not None else None,
@@ -1530,10 +1607,10 @@ def utc_text(unix_s):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(unix_s))
 
 
-def read_slow_datacenters(path=None):
-    """The slow datacenters podd recorded per pod kind ({} when none); a file that is not that is said loudly and set
-    aside."""
-    path = Path(path or SLOW_DATACENTERS_FILE)
+def read_avoided_datacenters(path=None):
+    """The avoided datacenters podd recorded per pod kind ({} when none); a file that is not that is said loudly and
+    set aside."""
+    path = Path(path or AVOIDED_DATACENTERS_FILE)
     try:
         recorded = json.loads(path.read_text())
     except FileNotFoundError:
@@ -1545,16 +1622,17 @@ def read_slow_datacenters(path=None):
     if not (isinstance(recorded, dict) and set(recorded) <= {"gpu", "cpu"}
             and all(isinstance(datacenters, dict) and all(
                 isinstance(record, dict) and job_contract.is_number(record.get("until_unix"))
+                and record.get("because") in AVOIDED_BECAUSE
                 for record in datacenters.values()) for datacenters in recorded.values())):
-        say(f"(╯°□°)╯ {path} is not {{\"gpu\" | \"cpu\": {{datacenter: {{until_unix, ...}}}}}}: no datacenter is "
-            f"avoided; it is moved to {path}.broken")
+        say(f"(╯°□°)╯ {path} is not {{\"gpu\" | \"cpu\": {{datacenter: {{until_unix, because {AVOIDED_BECAUSE}, "
+            f"...}}}}}}: no datacenter is avoided; it is moved to {path}.broken")
         os.replace(path, path.with_name(path.name + ".broken"))
         return {}
     return recorded
 
 
-def write_slow_datacenters(recorded, path=None):
-    path = Path(path or SLOW_DATACENTERS_FILE)
+def write_avoided_datacenters(recorded, path=None):
+    path = Path(path or AVOIDED_DATACENTERS_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     job_contract.write_json_atomically(path, recorded)
 

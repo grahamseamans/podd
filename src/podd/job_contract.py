@@ -64,12 +64,13 @@ THE JOB FILE:
 
 AN IMAGE PODD CAN RUN starts sshd with RunPod's PUBLIC_KEY on its own (port 22), carries bash, awk, procps
 (ps/pkill/pgrep) and rsync, and declares its facts in /etc/podd-facts.json (a JSON object; podd measures pod_name,
-pod_id, image, gpu, gpu_memory_gb, cpu, ram_gb, disk_gb, datacenter, cost_per_hr, ready_at itself, so an image may
-not declare those).
+pod_id, image, gpu, gpu_memory_gb, cuda_version, cpu, ram_gb, disk_gb, datacenter, cost_per_hr, ready_at itself, so
+an image may not declare those).
 """
 import datetime
 import json
 import os
+import re
 import traceback
 from pathlib import Path
 
@@ -85,8 +86,14 @@ PODD_ATTEMPTS_DIRECTORY = ".podd"                      # in the stage: each requ
                                                        # (attempt-<n>.command.log), podd's
 
 CONFIG_PATH = Path(os.environ.get("PODD_CONFIG", Path.home() / ".config" / "podd" / "config.json"))
-CONFIG_KEYS = ("queue_directories", "max_pods", "idle_minutes", "max_price_per_hour", "cards", "allowed_cuda_versions",
+CONFIG_KEYS = ("queue_directories", "max_pods", "idle_minutes", "max_price_per_hour", "cards", "min_cuda_version",
                "cpu_flavors")    # every one the account's own choice: config.example.json shows each
+# config keys that are gone, each with what replaced it: read_config refuses them by name, never as an unknown key
+RETIRED_CONFIG_KEYS = {
+    "allowed_cuda_versions": "replaced 2026-10-29 by `min_cuda_version` (e.g. \"12.8\"): the lowest driver CUDA "
+                             "version your images run. RunPod's allowedCudaVersions enum stops at 13.0, so the list "
+                             "shut out every host with a newer driver; podd now creates on any host and measures the "
+                             "driver on the pod"}
 POD_KINDS = ("gpu", "cpu")                      # max_pods caps each kind apart; a set requiring gpu "none" is cpu
 CPU_FLAVORS = ("cpu3c", "cpu3g", "cpu3m", "cpu5c", "cpu5g", "cpu5m")   # PodCreateInput.cpuFlavorIds' enum
                                     # (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json)
@@ -278,7 +285,9 @@ def read_config(path=None):
         raise JobContractError(f"(╯°□°)╯ podd config {path} is not JSON: {error}")
     config = {**CONFIG_DEFAULTS, **config} if isinstance(config, dict) else config
     problems = [f"no `{key}`" for key in CONFIG_KEYS if key not in config]
-    problems += [f"unknown key `{key}`" for key in config if key not in CONFIG_KEYS + tuple(CONFIG_DEFAULTS)]
+    problems += [f"`{key}` is {why}" for key, why in RETIRED_CONFIG_KEYS.items() if key in config]
+    problems += [f"unknown key `{key}`" for key in config
+                 if key not in CONFIG_KEYS + tuple(CONFIG_DEFAULTS) + tuple(RETIRED_CONFIG_KEYS)]
     if not problems:
         if not (isinstance(config["queue_directories"], list) and config["queue_directories"]
                 and all(isinstance(d, str) and Path(d).is_absolute() for d in config["queue_directories"])):
@@ -297,8 +306,10 @@ def read_config(path=None):
                 isinstance(card, dict) and isinstance(card.get("name"), str)
                 and isinstance(card.get("memory_gb"), (int, float)) for card in config["cards"])):
             problems.append("`cards` must be a non-empty list of {name, memory_gb}")
-        if not (isinstance(config["allowed_cuda_versions"], list) and config["allowed_cuda_versions"]):
-            problems.append("`allowed_cuda_versions` must be a non-empty list")
+        if not (isinstance(config["min_cuda_version"], str)
+                and re.fullmatch(r"[0-9]+\.[0-9]+", config["min_cuda_version"])):
+            problems.append(f"`min_cuda_version` must be a CUDA version \"<major>.<minor>\" (nvidia-smi's \"CUDA "
+                            f"Version\"), e.g. \"12.8\"; got {config['min_cuda_version']!r}")
         if not (isinstance(config["cpu_flavors"], list) and config["cpu_flavors"]
                 and all(flavor in CPU_FLAVORS for flavor in config["cpu_flavors"])):
             problems.append(f"`cpu_flavors` must be a non-empty list of RunPod CPU flavors {CPU_FLAVORS}")

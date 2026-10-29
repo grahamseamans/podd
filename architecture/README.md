@@ -59,7 +59,7 @@ THE PATTERN.
   Who writes what: the client JOB (`job_contract.write_job`, which checks the contract), the daemon RUNNING and DONE,
   either one FAILED (`job_contract.mark_stage_failed`, the one writer); `job_contract.stage_state` the one reader of a
   stage's state.
-- The account's choices live in the config, never in code: price cap, cards, CUDA versions, CPU flavors, caps, queues
+- The account's choices live in the config, never in code: price cap, cards, min CUDA version, CPU flavors, caps, queues
   (`job_contract.read_config` requires each). Code defaults exist only for measured RunPod behaviour (boot_seconds,
   max_wait_for_stock_minutes) and podd's own timing constants (daemon.py's top).
 - Resource packing, and a pod only when it would help: a job declares the cpu, card memory and RAM it uses; a pod
@@ -75,7 +75,7 @@ THE PATTERN.
   Everything else (facts, packing, idle, stock) is the GPU pods'.
 - Short of stock is waited out, not failed: pod.sh create exits 75 when RunPod has no instance of any card offered
   (2026-10-14: six jobs FAILED on one "no instances currently available"); the jobs stay JOB, podd says it loudly (and
-  in the status file) and retries one pod after 60 s doubling to 10 min, avoiding no datacenter, and only a set with
+  in the status file) and retries one pod after 60 s doubling to 10 min, avoiding no slow datacenter, and only a set with
   NO pod for max_wait_for_stock_minutes FAILS, with every miss: the clock runs only while no pod serves the set
   (2026-10-22: 20 jobs FAILED while 3 pods of their set ran).
 - Nothing fails quietly: every failure is a FAILED file (and the journal for podd's); a stage that failed stays until
@@ -96,8 +96,15 @@ THE PATTERN.
   among them); at SLOW_FACTOR (1.5; measured 2026-10-16 and 2026-10-21, daemon.py) the pod is SLOW, serves nothing (so
   the opening rule replaces it), moves the resumable jobs a move saves more than a boot, goes once empty, and its
   datacenter is avoided by creates of its kind (gpu / cpu) for SLOW_DATACENTER_HOURS
-  (~/.local/state/podd/slow-datacenters.json). A set short of stock keeps its slow pod and avoids nothing: a slow pod
-  is better than none.
+  (~/.local/state/podd/avoided-datacenters.json). A set short of stock keeps its slow pod and avoids no slow
+  datacenter: a slow pod is better than none.
+- The host's driver is measured, never filtered (2026-10-29: RunPod's allowedCudaVersions enum stops at 13.0, so a
+  list of versions matched no newer driver and every create was refused for 30+ min with A40s and L4s in stock): a
+  GPU create asks for any host, the pod's `cuda_version` is nvidia-smi's "CUDA Version", and a pod below the config's
+  min_cuda_version (integer tuples: 13.10 > 13.2) is deleted at once, its datacenter avoided by GPU creates (even short
+  of stock: unlike a slow pod it runs nothing), and its set takes it as a stock miss (jobs stay JOB, bounded by
+  max_wait_for_stock_minutes). An image that refuses the driver at container start never opens ssh: pod.sh create's
+  15 min wait, then a boot failure.
 - A failed pod delete is said loudly and retried every minute, never podd's end (2026-10-15: one RunPod HTTP 500 on
   a DELETE stopped podd, failing two running jobs on other pods and leaving two pods billing).
 - Pods never outlive their work: idle -> deleted, podd stopped -> deleted (a booting create is stopped first), podd

@@ -3,12 +3,14 @@ checked, a pod satisfies a job only when every requirement is met (the image's d
 any of them), a job goes to the fullest pod that satisfies it, jobs are packed on a pod by cpu / gpu memory / ram (best
 fit), pods are opened PER REQUIREMENT SET only while its backlog would outlast a boot (the drain time), offered every
 card under the price cap (in-stock first, cheapest first) and never one over it, RunPod short of stock leaves the jobs
-queued and retries after a backoff (avoiding no datacenter) until max_wait_for_stock_minutes, a job requiring an image no running pod has opens a pod for that image, a pod's facts are read
+queued and retries after a backoff (avoiding no slow datacenter) until max_wait_for_stock_minutes, a job requiring an image no running pod has opens a pod for that image, a pod's facts are read
 from what it prints (CPU quota, decimal GB, shadowing refused), the exit poll ends, a pod's ssh is through its own
 alias, a job requiring no card (requires.gpu "none") runs on a CPU pod sized by its jobs' cpu and RAM under the
 cap and created through pod.sh create-cpu (its real request body, against a fake curl), an interrupted job brings
 its outputs home and a resumable one is requeued to do the rest, a pod much slower than the median of the others (by pace, never by expected_s alone) is marked slow, moved off,
-replaced and its datacenter avoided (never while its set is short of stock), a set short of stock fails only after
+replaced and its datacenter avoided (never while its set is short of stock), a GPU pod's driver CUDA version is read
+from nvidia-smi and one below min_cuda_version is deleted with its jobs kept queued and its datacenter avoided (even
+short of stock), a GPU create sends no allowedCudaVersions, a set short of stock fails only after
 max_wait_for_stock_minutes with no pod, the deadline
 scales with expected_s and the pod's slowness, and podd imports nothing but the standard library.
 
@@ -32,18 +34,26 @@ REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE_DIRECTORY = REPOSITORY_ROOT / "src" / "podd"
 
 # never the real state: Pool() reads the slow datacenters, mark_slow writes them
-podd.SLOW_DATACENTERS_FILE = Path(tempfile.mkdtemp(prefix="podd-state-")) / "slow-datacenters.json"
+podd.AVOIDED_DATACENTERS_FILE = Path(tempfile.mkdtemp(prefix="podd-state-")) / "avoided-datacenters.json"
 
 IMAGE_A = "ghcr.io/example/solver:" + "a" * 40
 IMAGE_B = "ghcr.io/example/solver:" + "b" * 40
 FACTS_A = {"pod_name": "podd-g1", "pod_id": "pod-a", "image": IMAGE_A, "image_commit": "a" * 40, "engine": "1.0",
-           "solver_version": 1, "gpu": "NVIDIA A40", "gpu_memory_gb": 48.3, "cpu": 7.65, "ram_gb": 50.0, "disk_gb": 30.0}
+           "solver_version": 1, "gpu": "NVIDIA A40", "gpu_memory_gb": 48.3, "cuda_version": "12.8", "cpu": 7.65, "ram_gb": 50.0, "disk_gb": 30.0}
 CARDS = [{"name": "NVIDIA RTX A4500", "memory_gb": 20}, {"name": "NVIDIA RTX A5000", "memory_gb": 24},
          {"name": "NVIDIA A40", "memory_gb": 48}]
 
 OFFERS = {"NVIDIA RTX A4500": {"price_per_hour": 0.25, "stock": {}},                 # pod.sh avail's JSON
           "NVIDIA RTX A5000": {"price_per_hour": 0.27, "stock": {"EU-RO-1": "Low"}},
           "NVIDIA A40": {"price_per_hour": 0.59, "stock": {"CA-MTL-1": "Low"}}}
+
+# what GPU_ON_THE_POD prints on a card: --query-gpu's line, then nvidia-smi's summary (its header carries the driver's
+# CUDA version)
+NVIDIA_SMI_SUMMARY = """Wed Oct 29 18:02:11 2026
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.124.06             Driver Version: 570.124.06     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+"""
 
 
 def a_job(**changes):
@@ -97,21 +107,34 @@ def test_the_config_is_checked_and_a_requester_learns_whether_its_queue_is_watch
     path.write_text(json.dumps({"queue_directories": ["relative/queue"], "max_pods": 0}))
     message = raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "no `idle_minutes`")
     path.write_text(json.dumps({"queue_directories": [str(directory / "queue")], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
-                                "cards": CARDS, "allowed_cuda_versions": ["12.8"], "cpu_flavors": ["cpu3c"]}))
+                                "cards": CARDS, "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c"]}))
     raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "no `max_price_per_hour`")
     path.write_text(json.dumps({"queue_directories": [str(directory / "queue")], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
-                                "max_price_per_hour": 0.60, "cards": CARDS, "allowed_cuda_versions": ["12.8"]}))
+                                "max_price_per_hour": 0.60, "cards": CARDS, "min_cuda_version": "12.8"}))
     raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "no `cpu_flavors`")
     path.write_text(json.dumps({"queue_directories": [str(directory / "queue")], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
-                                "max_price_per_hour": 0.60, "cards": CARDS, "allowed_cuda_versions": ["12.8"],
+                                "max_price_per_hour": 0.60, "cards": CARDS, "min_cuda_version": "12.8",
                                 "cpu_flavors": ["cpu4x"]}))
     raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "`cpu_flavors` must be")
     path.write_text(json.dumps({"queue_directories": [str(directory / "queue")], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
-                                "max_price_per_hour": 0.60, "cards": CARDS, "allowed_cuda_versions": ["12.8"],
+                                "max_price_per_hour": 0.60, "cards": CARDS, "min_cuda_version": "12.8",
                                 "cpu_flavors": ["cpu3c"]}))
     config = podjobs.read_config(path)
     assert config["max_pods"] == {"gpu": 2, "cpu": 2} and config["max_price_per_hour"] == 0.60 and config["boot_seconds"] == 150, message
     assert config["max_wait_for_stock_minutes"] == 60
+    assert config["min_cuda_version"] == "12.8"
+    without_minimum = {key: value for key, value in config.items() if key != "min_cuda_version"}
+    path.write_text(json.dumps(without_minimum))
+    raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "no `min_cuda_version`")
+    path.write_text(json.dumps({**without_minimum, "allowed_cuda_versions": ["12.8", "12.9", "13.0"]}))
+    retired = raises(podjobs.JobContractError, lambda: podjobs.read_config(path),
+                     "`allowed_cuda_versions` is replaced 2026-10-29 by `min_cuda_version`", "enum stops at 13.0")
+    assert "unknown key" not in retired, "the old key is named with what replaced it, not as an unknown key"
+    path.write_text(json.dumps({**config, "allowed_cuda_versions": ["12.8"]}))
+    raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "`allowed_cuda_versions` is replaced")
+    for not_a_version in (12.8, "12", "12.8.1", "v12.8", ["12.8"]):
+        path.write_text(json.dumps({**config, "min_cuda_version": not_a_version}))
+        raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "`min_cuda_version` must be")
     path.write_text(json.dumps({**config, "slots_per_pod": 3}))
     raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "unknown key `slots_per_pod`")
     path.write_text(json.dumps({**config, "max_price_per_hour": 0}))
@@ -148,8 +171,8 @@ def test_a_pod_is_created_with_the_container_disk_its_set_requires_and_never_les
     assert podd.container_disk_gb(CPU_REQUIRES) == podd.CPU_CONTAINER_DISK_GB == 20
     assert podd.container_disk_gb({**CPU_REQUIRES, "disk_gb_min": 80}) == 80
     pod = podd.Pod("podd-g1", Path(tempfile.mkdtemp(prefix="podd-disk-")), {"image": IMAGE_A, "disk_gb_min": 80},
-                   {"allowed_cuda_versions": ["12.8"]}, ["NVIDIA A40"], 1)
-    assert pod.create_command()[1:] == ["create", "podd-g1", IMAGE_A, "NVIDIA A40", "1", "12.8", "80"]
+                   {"min_cuda_version": "12.8"}, ["NVIDIA A40"], 1)
+    assert pod.create_command()[1:] == ["create", "podd-g1", IMAGE_A, "NVIDIA A40", "1", "80"]
 
 
 def test_the_cards_asked_for_a_set_are_the_configs_order_filtered_by_name_and_memory():
@@ -237,7 +260,7 @@ def test_a_pool_whose_only_card_is_over_the_cap_opens_nothing_and_says_so():
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
               "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS + [{"name": "NVIDIA L40S",
                                                                                   "memory_gb": 48}],
-              "allowed_cuda_versions": ["12.8"]}
+              "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), {"NVIDIA L40S": {"price_per_hour": 1.09, "stock": {"OC-AU-1": "Low"}},
                                  **{card["name"]: {"price_per_hour": 0.90, "stock": {}} for card in CARDS}})
@@ -285,7 +308,7 @@ def test_a_looser_job_does_not_open_a_pod_while_a_pod_that_serves_it_boots():
     (stage / "in").write_text("x")
     podjobs.write_job(stage, a_job(requires={"image": IMAGE_A}))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS, "allowed_cuda_versions": ["12.8"]}
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     pool.pods["podd-g1"] = podd.Pod("podd-g1", secrets, a_job()["requires"], config)       # booting, stricter set
@@ -316,7 +339,7 @@ def test_a_job_requiring_an_image_no_running_pod_has_opens_a_pod_for_it():
     (stage / "in").write_text("x")
     podjobs.write_job(stage, a_job(requires={"image": IMAGE_B, "engine": "1.0", "solver_version": 1}))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS, "allowed_cuda_versions": ["12.8"]}
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     running_pod = podd.Pod("podd-g1", secrets, a_job()["requires"], config)
@@ -332,7 +355,7 @@ def test_a_job_requiring_an_image_no_running_pod_has_opens_a_pod_for_it():
     opened = [pod for name, pod in pool.pods.items() if name != "podd-g1"]
     assert len(opened) == 1 and opened[0].name == "podd-g2" and opened[0].started, (pool.pods, said.getvalue())
     assert opened[0].requires["image"] == IMAGE_B and opened[0].create_command()[3] == IMAGE_B
-    assert opened[0].create_command()[4:] == ["NVIDIA RTX A5000,NVIDIA A40,NVIDIA RTX A4500", "1", "12.8", "30"], \
+    assert opened[0].create_command()[4:] == ["NVIDIA RTX A5000,NVIDIA A40,NVIDIA RTX A4500", "1", "30"], \
         "every affordable card, in stock first, cheapest first"
     assert podjobs.stage_state(stage) == podjobs.JOB, "it waits for its pod; the running pod does not take it"
     assert "opening a pod for requirement set" in said.getvalue() and IMAGE_B in said.getvalue()
@@ -348,7 +371,7 @@ def test_a_pod_whose_facts_do_not_satisfy_its_set_fails_that_sets_jobs_and_is_ne
     (stage / "in").write_text("x")
     podjobs.write_job(stage, a_job(requires={"image": IMAGE_A, "engine": "2.0"}))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS, "allowed_cuda_versions": ["12.8"]}
+              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     mismatched = podd.Pod("podd-g1", secrets, {"image": IMAGE_A, "engine": "2.0"}, config)
@@ -384,7 +407,7 @@ def stock_pool(root, jobs=6, **config_changes):
         podjobs.write_job(stage, a_job(cpu="all", expected_s=75))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 8, "cpu": 8}, "idle_minutes": 3,
               "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
-              "allowed_cuda_versions": ["12.8"], **config_changes}
+              "min_cuda_version": "12.8", **config_changes}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     return pool, queue_directory
@@ -513,8 +536,8 @@ def test_a_set_short_of_stock_avoids_no_datacenter_and_a_cpu_ban_never_reaches_a
     and the CPU pods' bans cut the GPU creates too."""
     root = Path(tempfile.mkdtemp(prefix="podd-stock-"))
     pool, _ = stock_pool(root, jobs=1)
-    record = {"until_unix": time.time() + 3600, "until": "later", "why": "test", "pod": "podd-c1"}
-    pool.slow_datacenters = {"cpu": {"US-GA-2": dict(record)}, "gpu": {"US-MD-1": dict(record)}}
+    record = {"until_unix": time.time() + 3600, "until": "later", "why": "test", "pod": "podd-c1", "because": "slow"}
+    pool.avoided_datacenter_records = {"cpu": {"US-GA-2": dict(record)}, "gpu": {"US-MD-1": dict(record)}}
     saved = podd.Pod, podd.STATUS_FILE
     podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
     try:
@@ -529,8 +552,8 @@ def test_a_set_short_of_stock_avoids_no_datacenter_and_a_cpu_ban_never_reaches_a
             probe = next(iter(pool.pods.values()))
     finally:
         podd.Pod, podd.STATUS_FILE = saved
-    assert probe.avoid_datacenters == [] and len(probe.create_command()) == 8, probe.create_command()
-    assert "avoids no datacenter" in said.getvalue(), said.getvalue()[-600:]
+    assert probe.avoid_datacenters == [] and len(probe.create_command()) == 7, probe.create_command()
+    assert "does not avoid the slow datacenters US-MD-1" in said.getvalue(), said.getvalue()[-600:]
 
 
 def test_pod_sh_create_exiting_75_is_a_stock_miss_with_runpods_answer_not_a_boot_failure():
@@ -539,7 +562,7 @@ def test_pod_sh_create_exiting_75_is_a_stock_miss_with_runpods_answer_not_a_boot
     fake.write_text("#!/usr/bin/env bash\necho 'RunPod POST /pods -> HTTP 500: {\"error\":\"create pod: There are "
                     "no instances currently available\"}' >&2\nexit 75\n")
     fake.chmod(0o755)
-    pod = podd.Pod("podd-g1", root, a_job()["requires"], {"allowed_cuda_versions": ["12.8"]}, ["NVIDIA A40"])
+    pod = podd.Pod("podd-g1", root, a_job()["requires"], {"min_cuda_version": "12.8"}, ["NVIDIA A40"])
     saved = podd.POD_SCRIPT
     podd.POD_SCRIPT = fake
     try:
@@ -554,25 +577,117 @@ def test_pod_sh_create_exiting_75_is_a_stock_miss_with_runpods_answer_not_a_boot
 
 # 5. A POD'S FACTS, from what it printed
 def test_a_pods_facts_are_read_from_what_it_prints():
-    facts = podd.facts_of_pod('{"engine": "1.0", "solver_version": 1}', "NVIDIA RTX A4500, 20470\n",
+    facts = podd.facts_of_pod('{"engine": "1.0", "solver_version": 1}', "NVIDIA RTX A4500, 20470\n" + NVIDIA_SMI_SUMMARY,
                               "765000 100000\nnone\n96\n", "53687091200\nMemTotal:  1056000000 kB\n", IMAGE_A, {"cost_per_hr": 0.25, "datacenter": "EU-RO-1"},
                               "podd-g3", "pod-x", "now")
     assert facts["gpu"] == "NVIDIA RTX A4500" and facts["gpu_memory_gb"] == 21.46 and facts["cpu"] == 7.65, facts
     assert facts["engine"] == "1.0" and facts["image"] == IMAGE_A and facts["cost_per_hr"] == 0.25
     assert facts["ram_gb"] == 53.69, "cgroup memory.max, decimal GB"
     assert facts["disk_gb"] is None, "pod.sh recorded no container disk: unknown, never guessed"
-    assert podd.facts_of_pod("{}", "X, 1024", "max 100000\nnone\n12\n", "max\nMemTotal:  32000000 kB\n", IMAGE_A,
+    assert podd.facts_of_pod("{}", "X, 1024\n" + NVIDIA_SMI_SUMMARY, "max 100000\nnone\n12\n", "max\nMemTotal:  32000000 kB\n", IMAGE_A,
                              {"container_disk_gb": 80.0}, "p", "i", "now")["disk_gb"] == 80.0, "RunPod's containerDiskInGb"
-    unlimited = podd.facts_of_pod("{}", "X, 1024", "max 100000\nnone\n12\n", "max\nMemTotal:  32000000 kB\n", IMAGE_A, {},
+    unlimited = podd.facts_of_pod("{}", "X, 1024\n" + NVIDIA_SMI_SUMMARY, "max 100000\nnone\n12\n", "max\nMemTotal:  32000000 kB\n", IMAGE_A, {},
                                   "p", "i", "now")
     assert unlimited["cpu"] == 12.0 and unlimited["ram_gb"] == 32.77, unlimited
-    on_runpod = podd.facts_of_pod("{}", "X, 1024", "max 100000\nnone\n12\n", "max\nMemTotal:  540640000 kB\n", IMAGE_A,
+    on_runpod = podd.facts_of_pod("{}", "X, 1024\n" + NVIDIA_SMI_SUMMARY, "max 100000\nnone\n12\n", "max\nMemTotal:  540640000 kB\n", IMAGE_A,
                                   {"memory_gb": 50}, "p", "i", "now")
     assert on_runpod["ram_gb"] == 50, "no memory limit: RunPod's memoryInGb, not the host's 540 GB"
-    raises(podd.PodError, lambda: podd.facts_of_pod('{"gpu": "fake"}', "X, 1", "max 1\n1\n", "1\n", IMAGE_A, {}, "p",
+    raises(podd.PodError, lambda: podd.facts_of_pod('{"gpu": "fake"}', "X, 1\n" + NVIDIA_SMI_SUMMARY, "max 1\n1\n", "1\n", IMAGE_A, {}, "p",
                                                     "i", "now"), "podd measures itself")
-    raises(podd.PodError, lambda: podd.facts_of_pod("not json", "X, 1", "max 1\n1\n", "1\n", IMAGE_A, {}, "p", "i",
+    raises(podd.PodError, lambda: podd.facts_of_pod("not json", "X, 1\n" + NVIDIA_SMI_SUMMARY, "max 1\n1\n", "1\n", IMAGE_A, {}, "p", "i",
                                                     "now"), "is not JSON")
+
+
+# 5b. THE DRIVER'S CUDA VERSION (2026-10-29: allowedCudaVersions stops at 13.0 in RunPod's enum, so podd creates on any
+# host and measures the driver on the pod)
+def test_the_drivers_cuda_version_is_read_from_nvidia_smi_and_compared_as_numbers():
+    facts = podd.facts_of_pod("{}", "NVIDIA A40, 46068\n" + NVIDIA_SMI_SUMMARY, "max 100000\nnone\n12\n",
+                              "max\nMemTotal:  32000000 kB\n", IMAGE_A, {"datacenter": "US-TX-3"}, "p", "i", "now")
+    assert facts["cuda_version"] == "12.8" and facts["gpu"] == "NVIDIA A40", facts
+    newer = NVIDIA_SMI_SUMMARY.replace("570.124.06     CUDA Version: 12.8 ", "580.65.06      CUDA Version: 13.10")
+    assert podd.cuda_version_of(newer, "p") == "13.10"
+    assert podd.cuda_version_of("    Driver Version                            : 535.183.01\n"
+                                "    CUDA Version                              : 12.2\n", "p") == "12.2", "nvidia-smi -q"
+    raises(podd.PodError, lambda: podd.facts_of_pod("{}", "NVIDIA A40, 46068\n", "max 100000\nnone\n12\n",
+                                                    "max\nMemTotal:  32000000 kB\n", IMAGE_A, {}, "podd-g2", "i", "now"),
+           "podd-g2 printed no \"CUDA Version: X.Y\"")
+    assert podd.cuda_version_tuple("13.10") > podd.cuda_version_tuple("13.2"), "13.10 is newer than 13.2"
+    assert podd.cuda_version_tuple("12.10") < podd.cuda_version_tuple("13.0")
+    assert podd.old_driver(dict(facts, cuda_version="13.10"), "13.2") is None
+    assert podd.old_driver(dict(facts, cuda_version="12.8"), "12.8") is None, "the minimum itself is enough"
+    too_old = podd.old_driver(dict(facts, cuda_version="12.4"), "12.8")
+    assert "CUDA 12.4 < min_cuda_version 12.8" in too_old and "US-TX-3" in too_old, too_old
+    assert "cuda_version" in podd.MEASURED_FACTS, "an image may not declare it"
+
+
+def fake_pod_on_a_driver(root, cuda_version):
+    """A fake pod.sh (create succeeds), ssh (what a GPU pod on that driver prints) and rsync on PATH."""
+    (root / "bin").mkdir(parents=True)
+    scripts = {"pod.sh": "exit 0\n", "rsync": "exit 0\n", "ssh": f"""case "$2" in
+  *podd-facts*) echo '{{"engine": "1.0", "solver_version": 1}}' ;;
+  *nvidia-smi*) echo 'NVIDIA A40, 46068'; echo '| NVIDIA-SMI 550.54.15   Driver Version: 550.54.15   CUDA Version: {cuda_version} |' ;;
+  *cpu.max*) printf 'max 100000\\nnone\\n8\\n' ;;
+  *meminfo*) printf 'max\\nMemTotal:  50000000 kB\\n' ;;
+esac
+"""}
+    for name, body in scripts.items():
+        (root / "bin" / name).write_text("#!/usr/bin/env bash\n" + body)
+        (root / "bin" / name).chmod(0o755)
+    (root / podd.PODS_DIRECTORY_NAME).mkdir(parents=True)
+    (root / podd.PODS_DIRECTORY_NAME / "podd-g1.id").write_text("pod-old\n")
+    (root / podd.PODS_DIRECTORY_NAME / "podd-g1.session.json").write_text(json.dumps({"datacenter": "US-TX-3"}))
+
+
+def test_a_gpu_pod_below_min_cuda_version_is_an_old_driver_after_its_boot_and_one_at_the_minimum_is_ready():
+    for cuda_version, state in (("12.4", "old driver"), ("12.8", "ready"), ("13.1", "ready")):
+        root = Path(tempfile.mkdtemp(prefix="podd-driver-"))
+        fake_pod_on_a_driver(root, cuda_version)
+        pod = podd.Pod("podd-g1", root, a_job()["requires"], {"min_cuda_version": "12.8"}, ["NVIDIA A40"])
+        saved_script, saved_path = podd.POD_SCRIPT, os.environ["PATH"]
+        podd.POD_SCRIPT, os.environ["PATH"] = root / "bin" / "pod.sh", f"{root / 'bin'}:{saved_path}"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                pod.boot()
+        finally:
+            podd.POD_SCRIPT, os.environ["PATH"] = saved_script, saved_path
+        assert pod.state == state and pod.facts["cuda_version"] == cuda_version, (cuda_version, pod.state, pod.problem)
+        if state == "old driver":
+            assert "CUDA 12.4 < min_cuda_version 12.8" in pod.problem and "US-TX-3" in pod.problem, pod.problem
+
+
+def test_a_pod_on_an_old_driver_is_deleted_its_jobs_stay_queued_and_its_datacenter_is_avoided_even_short_of_stock():
+    root = Path(tempfile.mkdtemp(prefix="podd-driver-"))
+    pool, queue_directory = stock_pool(root, jobs=1)
+    saved = podd.Pod, podd.STATUS_FILE, podd.POD_SCRIPT
+    fake = root / "pod.sh"
+    fake.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake.chmod(0o755)
+    podd.Pod, podd.STATUS_FILE, podd.POD_SCRIPT = PodThatDoesNotBoot, root / "PODS.json", fake
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            pool.step()
+            old = next(iter(pool.pods.values()))
+            (pool.secrets / podd.PODS_DIRECTORY_NAME / f"{old.name}.id").write_text("pod-old\n")
+            old.created, old.facts = True, dict(FACTS_A, pod_id="pod-old", cuda_version="12.4", datacenter="US-TX-3")
+            old.problem, old.state = podd.old_driver(old.facts, "12.8"), "old driver"
+            pool.step()
+            assert not pool.pods and f"{old.name}: deleting pod pod-old" in said.getvalue(), said.getvalue()[-800:]
+            assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir()), \
+                "its jobs stay queued"
+            wait = next(iter(pool.short_of_stock.values()))
+            assert wait.misses == 1 and "CUDA 12.4 < min_cuda_version 12.8" in wait.story[-1], wait.story
+            recorded = json.loads(podd.AVOIDED_DATACENTERS_FILE.read_text())
+            assert recorded["gpu"]["US-TX-3"]["because"] == "old driver", recorded
+            assert "US-TX-3 is recorded OLD DRIVER for gpu pods" in said.getvalue(), said.getvalue()[-800:]
+            wait.retry_at_s = 0
+            pool.step()
+            probe = next(iter(pool.pods.values()))
+    finally:
+        podd.Pod, podd.STATUS_FILE, podd.POD_SCRIPT = saved
+    assert probe.avoid_datacenters == ["US-TX-3"] and probe.create_command()[-1] == "US-TX-3", \
+        "short of stock still avoids an old driver's datacenter: such a pod runs nothing"
+    assert podd.read_avoided_datacenters() == recorded, "kept across a restart"
+    podd.AVOIDED_DATACENTERS_FILE.unlink()
 
 
 # 6. THE EXIT POLL ends (podd's, per job)
@@ -734,7 +849,7 @@ def test_a_failed_delete_is_retried_and_does_not_stop_podd():
     fake.chmod(0o755)
     config = {"queue_directories": [str(root / "queue")], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
               "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
-              "allowed_cuda_versions": ["12.8"], "cpu_flavors": ["cpu3c"]}
+              "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c"]}
     pool = podd.Pool(secrets, config)
     pod = podd.Pod("podd-g1", secrets, a_job()["requires"], config)
     pool.pods["podd-g1"] = pod
@@ -788,6 +903,7 @@ def test_a_cpu_pod_serves_only_jobs_that_require_no_card_and_a_gpu_pod_never_ser
 def test_a_cpu_pods_facts_have_no_card():
     facts = podd.facts_of_pod('{"engine": "1.0"}', "none\n", "max 100000\n0-7\n8\n", "max\nMemTotal: 500000000 kB\n",
                               IMAGE_A, {"memory_gb": 16, "cost_per_hr": 0.24}, "podd-g1", "pod-c", "now")
+    assert facts["cuda_version"] is None and podd.old_driver(facts, "99.0") is None, "no card, no driver to judge"
     assert facts["gpu"] is None and facts["gpu_memory_gb"] == 0 and facts["cpu"] == 8.0 and facts["ram_gb"] == 16
     assert podd.cpu_of("max 100000\n5,101\n8\n") == 2.0, "a 2-vCPU cpu3g: two hyperthreads, whatever nproc says"
     assert podd.cpu_of("max 100000\n0-3,8-11\n96\n") == 8.0
@@ -835,7 +951,7 @@ def test_a_set_requiring_no_card_opens_a_cpu_pod_through_create_cpu():
         podjobs.write_job(stage, a_cpu_job(expected_s=3000))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
               "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
-              "allowed_cuda_versions": ["12.8"], "cpu_flavors": ["cpu3c", "cpu5c", "cpu3g"]}
+              "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c", "cpu5c", "cpu3g"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))   # never pod.sh avail-cpu in a test
     saved = podd.Pod, podd.STATUS_FILE
@@ -863,7 +979,7 @@ def test_gpu_and_cpu_pods_are_capped_apart():
             podjobs.write_job(stage, job)
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 3, "cpu": 2}, "idle_minutes": 3,
               "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
-              "allowed_cuda_versions": ["12.8"], "cpu_flavors": ["cpu3c", "cpu5c", "cpu3g"]}
+              "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c", "cpu5c", "cpu3g"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))
@@ -1139,7 +1255,7 @@ def slow_pool(root, pods=(("podd-c1", "EU-RO-1"), ("podd-c2", "US-MD-1"))):
     queue_directory.mkdir(parents=True)
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 2, "cpu": 4}, "idle_minutes": 3,
               "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_stock_minutes": 60, "cards": CARDS,
-              "allowed_cuda_versions": ["12.8"], "cpu_flavors": ["cpu3c"]}
+              "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))
     for name, datacenter in pods:
@@ -1202,20 +1318,20 @@ def test_a_pod_much_slower_than_the_median_is_marked_slow_its_resumable_jobs_mov
     assert said.count("IS SLOW") == 1 and "US-MD-1 is recorded SLOW for cpu pods" in said, said
     assert "deadline is now" in said
     assert podd.job_deadline_s(slow_fixed.job, slow.slowness, 2) > podd.job_deadline_s(slow_fixed.job, 1.0, 2)
-    recorded = json.loads(podd.SLOW_DATACENTERS_FILE.read_text())
+    recorded = json.loads(podd.AVOIDED_DATACENTERS_FILE.read_text())
     assert list(recorded) == ["cpu"] and list(recorded["cpu"]) == ["US-MD-1"], recorded
     assert recorded["cpu"]["US-MD-1"]["until_unix"] > time.time()
-    assert podd.read_slow_datacenters() == recorded, "kept across a restart"
+    assert podd.read_avoided_datacenters() == recorded, "kept across a restart"
     assert pool.avoided_datacenters("cpu") == ["US-MD-1"] and pool.avoided_datacenters("gpu") == []
     # a slow pod serves no set: placement skips it, the opening rule replaces it, and the new pod avoids US-MD-1
     pod = podd.Pod("podd-c4", pool.secrets, CPU_REQUIRES, pool.config, ["cpu3c"], 1, 8,
                    pool.avoided_datacenters("cpu"))
     assert pod.create_command()[1:] == ["create-cpu", "podd-c4", IMAGE_A, "cpu3c", "8", "20", "US-MD-1"]
-    pool.slow_datacenters["cpu"]["US-MD-1"]["until_unix"] = time.time() - 1
+    pool.avoided_datacenter_records["cpu"]["US-MD-1"]["until_unix"] = time.time() - 1
     with contextlib.redirect_stdout(io.StringIO()) as said:
         assert pool.avoided_datacenters("cpu") == [], "avoided for SLOW_DATACENTER_HOURS, then forgiven"
     assert "no longer avoided" in said.getvalue()
-    podd.SLOW_DATACENTERS_FILE.unlink()
+    podd.AVOIDED_DATACENTERS_FILE.unlink()
 
 
 def test_jobs_of_one_command_and_different_sizes_are_compared_by_pace_not_seconds_per_unit():
@@ -1257,7 +1373,7 @@ def test_a_lone_pod_is_never_slow_by_expected_s_and_a_set_short_of_stock_keeps_i
     pool.short_of_stock[podd.requirement_key(CPU_REQUIRES)] = podd.StockWait(time.time())
     said = judged(pool, root)
     assert pool.pods["podd-c2"].state == "ready" and slow_job.stop is None, "nothing would replace it: kept"
-    assert said.count("KEPT") == 1 and not podd.SLOW_DATACENTERS_FILE.exists(), said
+    assert said.count("KEPT") == 1 and not podd.AVOIDED_DATACENTERS_FILE.exists(), said
 
 
 def test_twenty_jobs_packed_on_one_a40_are_neither_killed_nor_marked_slow():
@@ -1303,7 +1419,7 @@ def test_twenty_jobs_packed_on_one_a40_are_neither_killed_nor_marked_slow():
         pool.judge_speeds()
     assert pool.pods["podd-c3"].state == "slow" and pool.pods["podd-c2"].state == "ready"
     assert pool.pods["podd-c4"].state == "ready"
-    podd.SLOW_DATACENTERS_FILE.unlink()
+    podd.AVOIDED_DATACENTERS_FILE.unlink()
 
 
 def test_a_slow_pod_takes_no_job_is_replaced_and_goes_once_empty():
@@ -1332,10 +1448,10 @@ def test_a_slow_pod_takes_no_job_is_replaced_and_goes_once_empty():
 
 
 def test_a_broken_slow_datacenters_file_is_said_and_set_aside():
-    path = Path(tempfile.mkdtemp(prefix="podd-dc-")) / "slow-datacenters.json"
+    path = Path(tempfile.mkdtemp(prefix="podd-dc-")) / "avoided-datacenters.json"
     path.write_text("{not json")
     with contextlib.redirect_stdout(io.StringIO()) as said:
-        assert podd.read_slow_datacenters(path) == {}
+        assert podd.read_avoided_datacenters(path) == {}
     assert "is not JSON" in said.getvalue() and path.with_name(path.name + ".broken").exists()
 
 
@@ -1388,14 +1504,15 @@ def test_pod_sh_create_avoids_the_slow_datacenters():
     body, _ = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "20", "US-MD-1,EU-SE-1")
     assert "US-MD-1" not in body["dataCenterIds"] and "EU-SE-1" not in body["dataCenterIds"]
     assert "EU-RO-1" in body["dataCenterIds"] and len(body["dataCenterIds"]) == 28, body["dataCenterIds"]
-    body, _ = body_of("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "12.8", "30", "US-MD-1")
+    body, _ = body_of("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "30", "US-MD-1")
     assert "US-MD-1" not in body["dataCenterIds"] and len(body["dataCenterIds"]) == 29
     assert body["containerDiskInGb"] == 30
-    body, _ = body_of("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "12.8", "80")
+    assert "allowedCudaVersions" not in body, "any host: RunPod's enum stops at 13.0 (podd measures the driver)"
+    body, _ = body_of("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "80")
     assert body["containerDiskInGb"] == 80 and "dataCenterIds" not in body, body
     body, _ = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "80")
     assert body["containerDiskInGb"] == 80, body
-    for arguments in (("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "12.8", "US-MD-1"),   # the old call, no disk
+    for arguments in (("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "12.8", "30"),   # the old call: cuda versions
                       ("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "79.5"), ("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8")):
         refused = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), *arguments], capture_output=True, text=True,
                                  env=environment, stdin=subprocess.DEVNULL)

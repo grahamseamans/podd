@@ -28,12 +28,13 @@ def print_status():
                       f"unit, slowness {progress['slowness']}")
         if not status["pods"]:
             print("  (none)")
-        for kind, datacenters in (status.get("slow_datacenters") or {}).items():
+        for kind, datacenters in (status.get("avoided_datacenters") or {}).items():
             if not all(isinstance(record, dict) for record in (datacenters or {}).values()):
                 print(f"  avoided (not {{datacenter: record}}, printed as is): {kind} {datacenters}")
                 continue
             for datacenter, record in (datacenters or {}).items():
-                print(f"  {kind} pods avoid until {record.get('until')}: {datacenter} ({record.get('why')})")
+                print(f"  {kind} pods avoid until {record.get('until')}: {datacenter} ({record.get('because')}: "
+                      f"{record.get('why')})")
         for key, wait in (status.get("short_of_stock") or {}).items():
             print(f"  (╯°□°)╯ NO STOCK for {key}: {wait['misses']} miss(es) since {wait['since']}, next create at "
                   f"{wait['next_create_at']}; " + (f"NO POD since {wait['no_pod_since']}: its jobs FAIL at "

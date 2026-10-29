@@ -10,12 +10,12 @@
 # (secrets.sh, the one place) and keeps each pod's files in $SECRETS/runpod_pods/.
 #
 #   pod.sh avail <cards>         # JSON: each card's $/h and the datacenters stocking it now
-#   pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB> [<avoid datacenters>]
+#   pod.sh create <name> <image> <cards> <min vCPU> <disk GB> [<avoid datacenters>]
 #                                             # a pod of <image> on the first free card of <cards> (comma-separated,
-#                                             # in the order RunPod tries them), >= <min vCPU> per GPU, on a host whose
-#                                             # driver runs one of <cuda versions> (comma-separated), a container disk
+#                                             # in the order RunPod tries them), >= <min vCPU> per GPU, on any host
+#                                             # (podd measures the driver's CUDA version on the pod), a container disk
 #                                             # of <disk GB> (whole GB; podd's container_disk_gb), any datacenter
-#                                             # but <avoid datacenters> (comma-separated: podd's slow ones);
+#                                             # but <avoid datacenters> (comma-separated: podd's avoided ones);
 #                                             # save its id, arm its watchdog (deleted $MAX_POD_HOURS (default 2) after
 #                                             # its lease was last renewed: podd renews it while the pod has work), wait
 #                                             # for ssh, write its ssh alias. Exit 75 (EX_TEMPFAIL): RunPod has no
@@ -209,24 +209,26 @@ print(json.dumps(offers, indent=1))'
   ;;
 create)
   name_the_pod "${2:-}"
-  IMAGE=${3:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB>}
-  CARDS=${4:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB>}
-  MIN_VCPU=${5:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB>}
-  CUDA_VERSIONS=${6:?pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB>}
-  DISK_GB=$(whole_gb "${7:-}")
-  DATACENTERS=$(datacenters_json "${8:-}")
+  IMAGE=${3:?pod.sh create <name> <image> <cards> <min vCPU> <disk GB>}
+  CARDS=${4:?pod.sh create <name> <image> <cards> <min vCPU> <disk GB>}
+  MIN_VCPU=${5:?pod.sh create <name> <image> <cards> <min vCPU> <disk GB>}
+  DISK_GB=$(whole_gb "${6:-}")
+  DATACENTERS=$(datacenters_json "${7:-}")
   # PodCreateInput (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json): ports 22/tcp only (full ssh, no
   # Jupyter); containerDiskInGb <disk GB>, podd's default 30 (daemon.py GPU_CONTAINER_DISK_GB; more when a job's
   # requires.disk_gb_min asks: the image does not count against it: / showed 16 MB used with /opt at 5.7 GB,
   # 2026-10-04); volumeInGb 0 (no pod volume: results come home); env {}: no PUBLIC_KEY, so RunPod injects the
   # account's ssh keys ($SECRETS/runpod_ssh_ed25519.pub is one of them); no dockerEntrypoint/StartCmd: the image's.
-  # allowedCudaVersions: the host driver must run the image's CUDA runtime. dataCenterIds only to avoid podd's slow
-  # datacenters (RUNPOD_DATACENTERS less them); else none: any datacenter.
-  body=$(IMAGE=$IMAGE CARDS=$CARDS MIN_VCPU=$MIN_VCPU CUDA_VERSIONS=$CUDA_VERSIONS DISK_GB=$DISK_GB NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
+  # NO allowedCudaVersions: its enum stops at 13.0 (PodCreateInput), so any list of versions shuts out every host with
+  # a newer driver (2026-10-29: the only stock under the cap was there; every create "no instances" for 30+ min, and
+  # created at once without the field). podd measures the driver on the pod and deletes one below min_cuda_version
+  # (daemon.py old_driver). dataCenterIds only to avoid podd's avoided datacenters (RUNPOD_DATACENTERS less them);
+  # else none: any datacenter.
+  body=$(IMAGE=$IMAGE CARDS=$CARDS MIN_VCPU=$MIN_VCPU DISK_GB=$DISK_GB NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
 import json, os
 body = {"name": os.environ["NAME"], "imageName": os.environ["IMAGE"], "cloudType": "SECURE",
     "gpuCount": 1, "gpuTypeIds": os.environ["CARDS"].split(","), "gpuTypePriority": "custom",
-    "minVCPUPerGPU": int(os.environ["MIN_VCPU"]), "allowedCudaVersions": os.environ["CUDA_VERSIONS"].split(","),
+    "minVCPUPerGPU": int(os.environ["MIN_VCPU"]),
     "ports": ["22/tcp"], "containerDiskInGb": int(os.environ["DISK_GB"]), "volumeInGb": 0, "volumeMountPath": "/workspace", "env": {},
     "supportPublicIp": True}
 if json.loads(os.environ["DATACENTERS"]) is not None:

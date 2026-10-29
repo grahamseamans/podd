@@ -54,14 +54,21 @@ pod.sh, no ssh, no rsync.
 - `max_price_per_hour`: a card (or a CPU pod's flavor x vCPUs) over it is never asked for (`pod.sh avail`: RunPod's
   securePrice and stock). create is offered EVERY accepted card under it, listed-in-stock first, cheapest first.
 - `cards`: the cards a GPU pod may be, each with RunPod's own `gpuTypes.memoryInGb`.
-- `allowed_cuda_versions`: host drivers a GPU pod may land on (match your image's CUDA runtime).
+- `min_cuda_version` (e.g. `"12.8"`): the lowest driver CUDA version (nvidia-smi's "CUDA Version") your images run.
+  A GPU create asks RunPod for ANY host (its `allowedCudaVersions` enum stops at 13.0, so a list shut out every newer
+  driver: 2026-10-29, every create refused for 30+ min while A40s and L4s under the cap were in stock); podd measures
+  the driver on the pod (`cuda_version`) and deletes a pod below this at once, loudly, avoids its datacenter for GPU
+  pods for `OLD_DRIVER_DATACENTER_HOURS` (even while short of stock: such a pod runs nothing), and counts it as a
+  stock miss (the jobs stay JOB). An image that refuses the driver at container start (`NVIDIA_REQUIRE_CUDA`) never
+  opens ssh: `pod.sh create` gives up after 15 min, a boot failure. The old key `allowed_cuda_versions` is refused by
+  name.
 - `cpu_flavors`: the RunPod CPU flavors a CPU pod may be (`pod.sh avail-cpu`: $/vCPU-h and RAM per vCPU from the REST
   v2 catalog).
 - `boot_seconds` (default 150, the measured 97-155 s): podd opens another pod only while the backlog would take
   longer than this to drain on the pods up or booting.
 - `max_wait_for_stock_minutes` (default 60): RunPod refusing a create for stock ("no instances currently available")
   is waited out, never a failure: the jobs stay JOB and podd retries one pod after 60 s, doubling to 10 min, avoiding
-  no datacenter (not even a slow one). While a pod of the set runs, its jobs wait for it however long; a set with NO
+  no slow datacenter (an old driver's still: such a pod runs nothing). While a pod of the set runs, its jobs wait for it however long; a set with NO
   pod for this long FAILS its jobs with every miss. `podd status` shows each wait and when it would fail.
 
 ## A job
@@ -114,7 +121,8 @@ A CPU job (`requires.gpu: "none"`, `gpu_memory_gb` 0) runs on a CPU pod that pod
 An image podd can run starts sshd with RunPod's PUBLIC_KEY on its own (port 22), carries bash, awk, procps
 (ps / pkill / pgrep) and rsync, and declares its facts in `/etc/podd-facts.json` (a JSON object, e.g.
 `{"image_commit": "...", "solver_version": 1}`). podd measures `pod_name`, `pod_id`, `image`, `gpu`,
-`gpu_memory_gb`, `cpu`, `ram_gb`, `disk_gb`, `datacenter`, `cost_per_hr`, `ready_at` itself, so an image may not declare those.
+`gpu_memory_gb`, `cuda_version`, `cpu`, `ram_gb`, `disk_gb`, `datacenter`, `cost_per_hr`, `ready_at` itself, so an
+image may not declare those.
 A pod whose image declares no facts is refused. Nothing is installed on a pod: a pod from the image runs jobs as soon
 as ssh answers.
 
@@ -142,14 +150,15 @@ podd-c1 .. podd-c<max_pods.cpu>). The key comes from `$SECRETS` (`src/podd/secre
 `$SECRETS/runpod_pods/<name>.*`:
 
     pod.sh avail <cards>                 # JSON: each card's $/h and the datacenters stocking it now
-    pod.sh create <name> <image> <cards> <min vCPU> <cuda versions> <disk GB> [<avoid datacenters>]   # podd's call
+    pod.sh create <name> <image> <cards> <min vCPU> <disk GB> [<avoid datacenters>]   # podd's call
     pod.sh avail-cpu <flavors>           # JSON: each CPU flavor's $/vCPU-h, RAM/vCPU, vCPU range, stock
     pod.sh create-cpu <name> <image> <flavors> <vCPU> <disk GB> [<avoid datacenters>]  # podd's call for a CPU pod
     pod.sh status <name> | delete <name> # delete prints the session's minutes and cost
     pod.sh recorded                      # the pods recorded here
     pod.sh account                       # every pod the RunPod account has: the leak check
 
-`create` passes `imageName`, `ports` 22/tcp, the container disk podd asks (30 GB unless a job requires more), no volume, any datacenter (or, given ones to
+`create` passes `imageName`, `ports` 22/tcp, the container disk podd asks (30 GB unless a job requires more), no volume,
+no `allowedCudaVersions` (any host: podd checks the driver itself), any datacenter (or, given ones to
 avoid, `dataCenterIds` = pod.sh's `RUNPOD_DATACENTERS` less them), and no `PUBLIC_KEY` (RunPod injects the account's
 ssh keys). It writes the `runpod-<name>` block of `~/.ssh/config`: the key, `BatchMode`, `ConnectTimeout 10`,
 `ServerAliveInterval 15` x `ServerAliveCountMax 4` (a dropped connection fails in ~60 s instead of hanging) and
@@ -164,7 +173,7 @@ the pod has work): the backstop for a podd that died.
 |---|---|
 | `~/.config/podd/config.json` | the config (read once, at start) |
 | `~/.local/state/podd/PODS.json` | the pool, rewritten whenever it changes (no secrets); `podd status` prints it |
-| `~/.local/state/podd/slow-datacenters.json` | `{"gpu" \| "cpu": {datacenter: ...}}`: datacenters a SLOW pod of that kind was in, avoided by that kind's creates for `SLOW_DATACENTER_HOURS` unless the set is short of stock (delete an entry to forgive one, then restart) |
+| `~/.local/state/podd/avoided-datacenters.json` | `{"gpu" \| "cpu": {datacenter: {..., "because": "slow" \| "old driver"}}}`: datacenters that kind's creates avoid: a SLOW pod's for `SLOW_DATACENTER_HOURS` unless the set is short of stock, an old driver's (GPU) for `OLD_DRIVER_DATACENTER_HOURS` always (delete an entry to forgive one, then restart) |
 | `$SECRETS/runpod_api_key`, `$SECRETS/runpod_pods/` | the key, and pod.sh's per-pod files |
 
 ## Tests
