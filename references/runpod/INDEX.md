@@ -13,6 +13,11 @@ What podd's code cites. Only this INDEX is in git (keep scripts, not scrapes); t
   - `docs/flash/configuration/cpu-types.mdx` — the instance ids (`cpu3c-8-16` = 8 vCPU, 16 GB) and the container disk
     cap (vCPU x 10 GB on cpu3*), which `pod.sh create-cpu`'s 20 GB disk fits from 2 vCPU.
   - `docs/references/cpu-types.mdx` — the CPU models behind the flavors.
+  - `docs/sdks/graphql/manage-pods.mdx` — GraphQL `pod(input: {podId}) { runtime { uptimeInSeconds ports } }`:
+    `pod.sh create`'s watch of the container while a pod boots (watch_the_container). The docs give no meaning
+    to a negative uptime; what a failing container answers was observed on throwaway pods, 2026-10-30, and is
+    written in pod.sh (THE CONTAINER WHILE A POD BOOTS). `lastStatusChange` (REST and GraphQL) stayed
+    "Rented by User: <time>" through a failing start: not a signal.
 - `runpod-rest-api-openapi-v1-2026-10-10.json` — the REST v1 OpenAPI spec as fetched 2026-10-10 from
   https://rest.runpod.io/v1/openapi.json (info.version 0.1.0), the one `pod.sh create` was written against:
   `PodCreateInput` (imageName, ports, dataCenterIds' enum = pod.sh's RUNPOD_DATACENTERS), `Pod.costPerHr` on the

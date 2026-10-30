@@ -18,8 +18,10 @@
 #                                             # but <avoid datacenters> (comma-separated: podd's avoided ones);
 #                                             # save its id, arm its watchdog (deleted $MAX_POD_HOURS (default 2) after
 #                                             # its lease was last renewed: podd renews it while the pod has work), wait
-#                                             # for ssh, write its ssh alias. Exit 75 (EX_TEMPFAIL): RunPod has no
-#                                             # instance of any card offered now (a stock race, not an error: retry)
+#                                             # for ssh (exit 1 once its container fails to start twice:
+#                                             # watch_the_container), write its ssh alias. Exit 75 (EX_TEMPFAIL):
+#                                             # RunPod has no instance of any card offered now (a stock race, not an
+#                                             # error: retry)
 #   pod.sh avail-cpu <flavors>   # JSON: each CPU flavor's $/vCPU-h, RAM per vCPU, vCPU range, stock
 #   pod.sh create-cpu <name> <image> <flavors> <vCPU> <disk GB> [<avoid datacenters>]
 #                                             # a CPU pod (no card) of <image>: the first free flavor of <flavors>
@@ -93,6 +95,80 @@ print(json.dumps(allowed))'
 # field '<python expr over d>': the expressions are this script's own literals, never input, so eval is safe here
 field() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {}, {'d': d}))" "$1"; }
 
+# THE CONTAINER WHILE A POD BOOTS. RunPod's GraphQL Pod.runtime (references/runpod/docs/sdks/graphql/manage-pods.mdx:
+# runtime { uptimeInSeconds ports }) is null until the pod's container first starts; the REST Pod has no such field,
+# and its lastStatusChange / desiredStatus say nothing of a failed start ("Rented by User: <time>" / RUNNING
+# throughout, observed). What RunPod answered, 2026-10-30, polled every ~5-30 s on throwaway L4 pods (US-MO-2,
+# EUR-IS-*):
+#   - a container that starts: runtime null while the image pulls (nvidia/cuda base: 13 s; podd's ai_research image:
+#     ~6 min, null every reading), then uptimeInSeconds 6, 37, 69 ... 342 (only rising, never below 0), ports listed;
+#   - a container whose start fails (dockerEntrypoint a missing file: runc's "OCI runtime create failed", the same
+#     error an image refusing an old driver gives, NVIDIA_REQUIRE_CUDA): uptimeInSeconds -5, -6, 0, -4, -3, 0, 1, -10,
+#     -3 with ports null (RunPod restarting it; one flicker at 1 with the ssh port mapped), for 5 min;
+#   - a container that starts and dies at once (dockerStartCmd a missing file): -9, -8, -5, 1, -14, -10, 1, ...
+# An old-driver host could not be had on demand (any create lands on any host), so that case is these two.
+# A FAILED START is a reading below 0, or below the one before (a restart). FAILED_CONTAINER_STARTS of them fail the
+# create (exit 1: podd's "did not boot", a miss of the set's wait; it deletes the pod).
+FAILED_CONTAINER_STARTS=2
+
+# container_uptime <pod id>: the container's GraphQL runtime.uptimeInSeconds, one word: an integer, "none" (runtime
+# null: not started yet) or "unknown" (RunPod did not answer the question: said loudly, the wait goes on, bounded by
+# its 15 min). An answer of any other shape -- the pod gone, a runtime without a whole uptime -- is a loud exit 1.
+container_uptime() {
+  local answer
+  if ! answer=$(curl -sS --fail-with-body -H 'Content-Type: application/json' -H @<(auth) https://api.runpod.io/graphql \
+      -d "{\"query\":\"query { pod(input: {podId: \\\"$1\\\"}) { runtime { uptimeInSeconds } } }\"}" 2>&1); then
+    echo "pod.sh: (・_・;) RunPod GraphQL did not answer for pod $1's container (the wait goes on): ${answer:0:300}" >&2
+    echo unknown
+    return
+  fi
+  ANSWER=$answer POD=$1 python3 -c '
+import json, os, sys
+said = os.environ["ANSWER"]
+try:
+    answer = json.loads(said)
+except ValueError:
+    answer = None
+if not isinstance(answer, dict) or answer.get("errors") or not isinstance(answer.get("data"), dict) \
+        or "pod" not in answer["data"]:
+    print("pod.sh: (・_・;) RunPod GraphQL did not answer for pod %s'"'"'s container (the wait goes on): %s"
+          % (os.environ["POD"], said[:300]), file=sys.stderr)
+    print("unknown"); sys.exit()
+pod = answer["data"]["pod"]
+if pod is None:
+    sys.exit("pod.sh: (╯°□°)╯ RunPod GraphQL has no pod %s any more (deleted while it booted?): %s"
+             % (os.environ["POD"], said[:300]))
+runtime = pod.get("runtime") if isinstance(pod, dict) else "not a pod"
+if runtime is None:
+    print("none"); sys.exit()
+uptime = runtime.get("uptimeInSeconds") if isinstance(runtime, dict) else None
+if type(uptime) is not int:
+    sys.exit("pod.sh: (╯°□°)╯ RunPod GraphQL answered a container runtime pod.sh does not know for pod %s (a whole "
+             "uptimeInSeconds or null expected): %s" % (os.environ["POD"], said[:300]))
+print(uptime)'
+}
+
+# watch_the_container <pod id>: one reading of the container (container_uptime); a failed start (below 0, or below the
+# last reading) is said and counted in failed_container_starts, and the FAILED_CONTAINER_STARTS-th fails the create.
+# create_the_pod sets failed_container_starts=0 and last_container_uptime="" before its waits.
+watch_the_container() {
+  local uptime
+  uptime=$(container_uptime "$1")
+  [[ $uptime =~ ^-?[0-9]+$ ]] || return 0
+  if (( uptime < 0 )) || { [[ -n $last_container_uptime ]] && (( uptime < last_container_uptime )); }; then
+    failed_container_starts=$(( failed_container_starts + 1 ))
+    echo "pod.sh: (・_・;) pod $NAME ($1): its container is not staying up (RunPod's runtime.uptimeInSeconds" \
+         "$uptime after ${last_container_uptime:-nothing}), failed start $failed_container_starts of" \
+         "$FAILED_CONTAINER_STARTS" >&2
+    if (( failed_container_starts >= FAILED_CONTAINER_STARTS )); then
+      echo "pod $NAME ($1): its container failed to start $failed_container_starts times (RunPod restarting it:" \
+           "an image refusing the host's driver, OCI runtime create failed, looks like this)" >&2
+      exit 1
+    fi
+  fi
+  last_container_uptime=$uptime
+}
+
 # create_the_pod <name> <PodCreateInput JSON>: POST /pods, save the id, arm the watchdog, record price + RAM +
 # container disk + datacenter, wait for ssh, write the alias. GPU and CPU pods alike (create, create-cpu).
 create_the_pod() {
@@ -132,12 +208,18 @@ create_the_pod() {
   [ -n "$container_disk_gb" ] || echo "pod.sh: (・_・;) the create response carries no containerDiskInGb: $created" >&2
   COST=$cost_per_hr T0=$t0 DC=$datacenter MEMORY=$memory_gb DISK=$container_disk_gb python3 -c 'import json, os; print(json.dumps({"cost_per_hr": float(os.environ["COST"]) if os.environ["COST"] else None, "created_at_unix_s": int(os.environ["T0"]), "datacenter": os.environ["DC"] or None, "memory_gb": float(os.environ["MEMORY"]) if os.environ["MEMORY"] else None, "container_disk_gb": float(os.environ["DISK"]) if os.environ["DISK"] else None}))' > $POD_SESSION_FILE
   echo "pod $NAME ($pod) created in ${datacenter:-an unnamed datacenter} at \$$cost_per_hr/h; waiting for its ssh port"
+  # Every wait for the pod also watches its container (watch_the_container): one that does not stay up fails the
+  # create in seconds, not after the 15 min below. Both waits: a failing container's ssh port flickers up (observed
+  # 2026-10-30), so the port alone can pass the first wait into an ssh that never answers.
+  failed_container_starts=0 last_container_uptime=""
   until rest GET /pods/$pod | field 'd.get("publicIp") and (d.get("portMappings") or {}).get("22") or ""' | grep -q .; do
+    watch_the_container "$pod"
     [ $(( $(date +%s) - t0 )) -lt 900 ] || { echo "pod $NAME ($pod): no public ssh port after 15 min" >&2; exit 1; }
     sleep 5
   done
   "$0" ssh-config "$NAME"
   until ssh -o ConnectTimeout=5 -o BatchMode=yes $SSH_ALIAS true 2>/dev/null; do
+    watch_the_container "$pod"
     [ $(( $(date +%s) - t0 )) -lt 900 ] || { echo "pod $NAME ($pod): ssh never answered" >&2; exit 1; }
     sleep 5
   done
@@ -335,6 +417,6 @@ else:
   rm -f $POD_SESSION_FILE $POD_LEASE_FILE; rm $POD_ID_FILE
   ;;
 *)
-  sed -n '2,32p' "$0"; exit 1
+  sed -n '2,34p' "$0"; exit 1
   ;;
 esac

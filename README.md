@@ -60,7 +60,9 @@ pod.sh, no ssh, no rsync.
   the driver on the pod (`cuda_version`) and deletes a pod below this at once, loudly, avoids its datacenter for GPU
   pods for `OLD_DRIVER_DATACENTER_HOURS` (even while its set waits for a pod: such a pod runs nothing), and counts it as a
   no-pod miss (the jobs stay JOB). An image that refuses the driver at container start (`NVIDIA_REQUIRE_CUDA`) never
-  opens ssh: `pod.sh create` gives up after 15 min, a boot failure (a miss, like stock). The old key `allowed_cuda_versions` is refused by
+  stays up: RunPod restarts it (GraphQL `runtime.uptimeInSeconds` below 0 or going back), and `pod.sh create` exits 1 on
+  the second such reading, seconds after the image is pulled (no longer at its 15 min ssh limit): a boot failure (a
+  miss, like stock). The old key `allowed_cuda_versions` is refused by
   name.
 - `cpu_flavors`: the RunPod CPU flavors a CPU pod may be (`pod.sh avail-cpu`: $/vCPU-h and RAM per vCPU from the REST
   v2 catalog).

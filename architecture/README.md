@@ -109,8 +109,10 @@ THE PATTERN.
   GPU create asks for any host, the pod's `cuda_version` is nvidia-smi's "CUDA Version", and a pod below the config's
   min_cuda_version (integer tuples: 13.10 > 13.2) is deleted at once, its datacenter avoided by GPU creates (even while its set
   waits for a pod: unlike a slow pod it runs nothing), and its set takes it as a no-pod miss (jobs stay JOB, bounded by
-  max_wait_for_a_pod_minutes). An image that refuses the driver at container start never opens ssh: pod.sh create's
-  15 min wait, then a boot failure (a miss, above).
+  max_wait_for_a_pod_minutes). An image that refuses the driver at container start never stays up: pod.sh create
+  watches RunPod's GraphQL runtime.uptimeInSeconds while it waits and exits 1 on the second failed start (below 0,
+  or below the reading before: 2026-10-30, observed on throwaway pods), not at its 15 min limit: a boot failure (a
+  miss, above).
 - A failed pod delete is said loudly and retried every minute, never podd's end (2026-10-15: one RunPod HTTP 500 on
   a DELETE stopped podd, failing two running jobs on other pods and leaving two pods billing).
 - Pods never outlive their work: idle -> deleted, podd stopped -> deleted (a booting create is stopped first), podd

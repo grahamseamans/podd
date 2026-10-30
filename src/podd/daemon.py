@@ -74,7 +74,9 @@ is deleted at once, its datacenter avoided by GPU creates for OLD_DRIVER_DATACEN
 for a pod (an old-driver pod runs nothing, unlike a slow one), and the miss counts as a no-pod miss: the jobs stay JOB,
 the next create backs off, and a set with no pod for max_wait_for_a_pod_minutes FAILS (Pool.reject_old_driver).
 An image that refuses the old driver at container start (NVIDIA_REQUIRE_CUDA: "OCI runtime create failed") never
-opens ssh: pod.sh create gives up after 15 min and exits 1, which is a boot failure like any other (a miss). Ready: takes jobs.
+stays up: pod.sh create sees RunPod restart it (GraphQL runtime.uptimeInSeconds below 0 or going back, twice) and
+exits 1 seconds after the image is pulled (its 15 min ssh limit is the backstop), a boot failure like any other (a
+miss). Ready: takes jobs.
 SLOW or BROKEN: takes no more, deleted once empty. Deleted
 after idle_minutes with no job, when a job on it failed for a reason of the pod's own (ssh, rsync: it is BROKEN), once
 SLOW and empty, or when podd stops (a booting create is stopped, its pod deleted). pod.sh's watchdog

@@ -12,7 +12,8 @@ replaced and its datacenter avoided (never while its set is waiting for a pod), 
 from nvidia-smi and one below min_cuda_version is deleted with its jobs kept queued and its datacenter avoided (even
 while its set waits for a pod), a GPU create sends no allowedCudaVersions, a set waiting for a pod fails only after
 max_wait_for_a_pod_minutes with no pod, a pod that did not boot is a miss of that same wait (its set's jobs stay queued,
-a create follows the backoff) while a job no pod can hold still fails at once, the deadline
+a create follows the backoff) while a job no pod can hold still fails at once, a container RunPod keeps restarting
+fails the real pod.sh create in seconds (and an answer it does not know, at once), the deadline
 scales with expected_s and the pod's slowness, and podd imports nothing but the standard library.
 
     PYTHONPATH=src /usr/bin/python3 tests/test_podd.py      (from the repo root; or with podd installed)
@@ -919,6 +920,112 @@ def test_every_pod_sh_command_reaches_its_own_arm():
                                  stdin=subprocess.DEVNULL)
         assert refused.returncode == 1 and "a pod name ([a-z0-9-]+) is required" in refused.stderr, \
             (command, refused.stdout[:200], refused.stderr[:200])
+
+
+# 7b1. a container that does not stay up fails the create in seconds (2026-10-29 16:42: a pod whose container never
+# started was found out only by the 15 min wait for its ssh port). The REAL pod.sh create against a fake curl and ssh:
+# RunPod's answers are what throwaway pods answered 2026-10-30 (pod.sh, THE CONTAINER WHILE A POD BOOTS).
+POD_WITHOUT_PORTS = '{"id": "pod-z", "publicIp": "", "portMappings": null}'
+POD_WITH_PORTS = '{"id": "pod-z", "publicIp": "66.92.198.138", "portMappings": {"22": 11053}}'
+
+
+def runtime_answer(uptime):
+    """RunPod GraphQL's answer to pod(input: {podId}) { runtime { uptimeInSeconds } }; None: no container yet."""
+    return json.dumps({"data": {"pod": {"runtime": None if uptime is None else {"uptimeInSeconds": uptime}}}})
+
+
+def pod_sh_create_against(rest_pod_answers, graphql_answers, ssh_answers):
+    """The real pod.sh create podd-z with curl and ssh faked first on PATH. rest_pod_answers: GET /pods/pod-z's bodies
+    in turn (the last one repeats); graphql_answers: one body per GraphQL call ("FAIL <body>": curl fails, as
+    --fail-with-body does on an HTTP error); ssh_answers: whether `ssh <alias> true` gets in, in turn (the last
+    repeats). -> (the finished process, the seconds it took)."""
+    root = Path(tempfile.mkdtemp(prefix="podsh-container-"))
+    (root / ".secrets").mkdir(mode=0o700)
+    (root / ".secrets" / "runpod_api_key").write_text("not-a-key\n")
+    (root / ".secrets" / "runpod_ssh_ed25519").write_text("not-a-key\n")
+    (root / "bin").mkdir()
+    (root / "rest-pod-answers").write_text("".join(answer + "\n" for answer in rest_pod_answers))
+    (root / "graphql-answers").write_text("".join(answer + "\n" for answer in graphql_answers))
+    (root / "ssh-answers").write_text("".join(("0" if gets_in else "255") + "\n" for gets_in in ssh_answers))
+    next_answer = ('next_answer() { local answer; answer=$(head -1 "$1"); '
+                   '[ "$(wc -l < "$1")" -gt 1 ] && sed -i 1d "$1"; printf "%s" "$answer"; }\n')
+    fake_curl = root / "bin" / "curl"
+    fake_curl.write_text("#!/usr/bin/env bash\n" + next_answer +
+                         'method=GET; url=""; previous=""\n'
+                         'for argument in "$@"; do [ "$previous" = -X ] && method=$argument; '
+                         'case $argument in https://*) url=$argument;; esac; previous=$argument; done\n'
+                         'case "$method $url" in\n'
+                         '"POST https://rest.runpod.io/v1/pods") printf \'%s\\n200\' \'{"id": "pod-z", "costPerHr": '
+                         '0.59, "memoryInGb": 94, "containerDiskInGb": 30}\';;\n'
+                         '"GET https://rest.runpod.io/v1/pods/pod-z?includeMachine=true") printf \'%s\\n200\' '
+                         '\'{"id": "pod-z", "machine": {"dataCenterId": "US-MO-2"}}\';;\n'
+                         '"GET https://rest.runpod.io/v1/pods/pod-z") printf \'%s\\n200\' '
+                         '"$(next_answer "$HOME/rest-pod-answers")";;\n'
+                         '"GET https://api.runpod.io/graphql")\n'
+                         '  answer=$(head -1 "$HOME/graphql-answers"); sed -i 1d "$HOME/graphql-answers"\n'
+                         '  [ -n "$answer" ] || { echo "fake curl: no GraphQL answer left" >&2; exit 99; }\n'
+                         '  [[ $answer == FAIL* ]] && { printf "%s" "${answer#FAIL }"; '
+                         'echo "curl: (22) The requested URL returned error: 503" >&2; exit 22; }\n'
+                         '  printf "%s" "$answer";;\n'
+                         '*) echo "fake curl: unexpected $method $url" >&2; exit 99;;\n'
+                         'esac\n')
+    fake_ssh = root / "bin" / "ssh"
+    fake_ssh.write_text("#!/usr/bin/env bash\n" + next_answer +
+                        'case "$*" in\n'
+                        '*" true") exit "$(next_answer "$HOME/ssh-answers")";;\n'
+                        "*lstart*) date +%s;;\n"
+                        '*nvidia-smi*) echo "NVIDIA L4, 23034 MiB";;\n'
+                        "esac\n")
+    fake_curl.chmod(0o755)
+    fake_ssh.chmod(0o755)
+    environment = {**os.environ, "HOME": str(root), "PATH": f"{root / 'bin'}:{os.environ['PATH']}"}
+    environment.pop("PODD_SECRETS", None)
+    started_s = time.time()
+    try:
+        created = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), "create", "podd-z", IMAGE_A, "NVIDIA L4", "4",
+                                  "30"], capture_output=True, text=True, env=environment, stdin=subprocess.DEVNULL,
+                                 timeout=120)
+    finally:   # the watchdog pod.sh armed ends once no pod is recorded under the name (within its 60 s sleep)
+        (root / ".secrets" / "runpod_pods" / "podd-z.id").unlink(missing_ok=True)
+    return created, time.time() - started_s
+
+
+def test_a_container_that_keeps_restarting_fails_the_create_in_seconds_even_after_its_ssh_port_flickered_up():
+    """2026-10-30 (pod.sh): a failing container's ssh port was mapped for a moment, so the port wait passed and ssh
+    never got in; RunPod's uptime went back (a restart) and below 0. Two failed starts fail the create: exit 1, which
+    podd takes as a pod that did not boot (a miss of its set's wait, the pod deleted)."""
+    created, took_s = pod_sh_create_against([POD_WITH_PORTS], [runtime_answer(37), runtime_answer(2),
+                                                               runtime_answer(-4)], [False])
+    assert created.returncode == 1, (created.returncode, created.stdout[-500:], created.stderr[-1500:])
+    assert "uptimeInSeconds 2 after 37), failed start 1 of 2" in created.stderr, created.stderr[-1500:]
+    assert "uptimeInSeconds -4 after 2), failed start 2 of 2" in created.stderr, created.stderr[-1500:]
+    assert "its container failed to start 2 times" in created.stderr.splitlines()[-1], created.stderr[-500:]
+    assert took_s < 60, f"failed in {took_s:.0f} s, not at the 15 min limit"
+
+
+def test_a_container_that_starts_boots_through_runpod_not_answering_and_never_counts_a_failed_start():
+    """A container not started yet (runtime null) and RunPod's GraphQL not answering (HTTP 503 "Service Unavailable",
+    seen 2026-10-30 while polling; and a 200 with no data) are waited through, each said; a rising uptime is fine."""
+    created, _ = pod_sh_create_against(
+        [POD_WITHOUT_PORTS, POD_WITHOUT_PORTS, POD_WITHOUT_PORTS, POD_WITH_PORTS],
+        ['FAIL {"message":"Service Unavailable"}', '{"message":"Service Unavailable"}', runtime_answer(None),
+         runtime_answer(0), runtime_answer(6)], [False, True])
+    assert created.returncode == 0, (created.returncode, created.stdout[-500:], created.stderr[-1500:])
+    assert created.stderr.count("RunPod GraphQL did not answer for pod pod-z's container (the wait goes on)") == 2, \
+        created.stderr[-1500:]
+    assert "failed start" not in created.stderr and "pod podd-z: ssh up" in created.stdout, created.stderr[-1500:]
+
+
+def test_a_container_answer_pod_sh_does_not_know_fails_the_create_loudly_at_once():
+    """Not ignored: a runtime without a whole uptime, or the pod gone from RunPod while it boots, fails the create at
+    once with RunPod's answer."""
+    for answer, said in (('{"data": {"pod": {"runtime": {"uptimeInSeconds": "soon"}}}}',
+                          "a container runtime pod.sh does not know"),
+                         ('{"data": {"pod": {"runtime": {"uptime": 12}}}}', "a container runtime pod.sh does not know"),
+                         ('{"data": {"pod": null}}', "RunPod GraphQL has no pod pod-z any more")):
+        created, took_s = pod_sh_create_against([POD_WITHOUT_PORTS], [answer], [False])
+        assert created.returncode == 1 and said in created.stderr, (answer, created.returncode, created.stderr[-800:])
+        assert answer[:40] in created.stderr and took_s < 20, (answer, took_s, created.stderr[-800:])
 
 
 # 7b2. a failed delete is said and retried, never podd's end (2026-10-15: RunPod's DELETE answered HTTP 500 "unexpected
