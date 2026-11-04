@@ -57,6 +57,14 @@ THE JOB FILE:
     resume_from  with `resumable` (required there, nowhere else): [path in the stage, inside one of the outputs]: the
                  SMALL files that say what earlier attempts finished (a manifest; a log to append to), never the work
                  itself. podd ships those present in the stage with the inputs; none present = a first attempt.
+    bring_home_every_s  optional: a positive number of seconds. While the command RUNS, podd brings command.log
+                 (and every `bring_home` file that exists) home into the stage at most this often (at the exit poll's
+                 pace, POLL_SECONDS at the fastest), each laid over the stage's copy by rsync (a reader never sees half a
+                 file), so a client can stream the job's progress from the stage. Off without it. A pull that fails is
+                 said loudly and the job runs on (the pull after the exit is the one that counts).
+    bring_home   optional, with `bring_home_every_s` only: [path in the stage, inside one of the outputs]: the files
+                 brought home with command.log while it runs (keep them small: they cross this machine's link every
+                 time). command.log alone without it.
     label        optional: how podd's log names the job.
     attempts     podd's: one record per earlier attempt of a requeued job (pod, datacenter, why it stopped, progress,
                  seconds per unit); a requester never writes it.
@@ -81,7 +89,8 @@ POD_MEASURED_REQUIREMENTS = ("image", "gpu", "gpu_memory_gb_min", "cpu_min", "di
                                                                                      # other key is a fact the image
                                                                                      # declares
 JOB_KEYS = ("command", "inputs", "outputs", "requires", "cpu", "gpu_memory_gb", "expected_s")
-OPTIONAL_JOB_KEYS = ("ram_gb", "progress", "resumable", "resume_from", "label", "queued_at", "attempts")
+OPTIONAL_JOB_KEYS = ("ram_gb", "progress", "resumable", "resume_from", "bring_home_every_s", "bring_home", "label",
+                     "queued_at", "attempts")
 PODD_ATTEMPTS_DIRECTORY = ".podd"                      # in the stage: each requeued attempt's command.log
                                                        # (attempt-<n>.command.log), podd's
 
@@ -100,6 +109,10 @@ RETIRED_CONFIG_KEYS = {
 POD_KINDS = ("gpu", "cpu")                      # max_pods caps each kind apart; a set requiring gpu "none" is cpu
 CPU_FLAVORS = ("cpu3c", "cpu3g", "cpu3m", "cpu5c", "cpu5g", "cpu5m")   # PodCreateInput.cpuFlavorIds' enum
                                     # (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json)
+# optional config keys whose default is another key's value: read_config fills each in from that key
+CONFIG_DEFAULTS_FROM_KEYS = {"max_cpu_price_per_hour": "max_price_per_hour"}   # a CPU pod's cap (flavor x vCPUs):
+                                                  # the cards' cap unless set apart (2026-11-04: at the shared $0.60 a
+                                                  # CPU pod stopped at 16 vCPU; a test run wanted 32)
 CONFIG_DEFAULTS = {"boot_seconds": 150,           # create -> ready, measured 97-155 s (2026-10-13..14): podd opens
                                                   # another pod only when the backlog would outlast a boot
                    "max_wait_for_a_pod_minutes": 60}  # a set RunPod has no pod for this long FAILS its jobs (podd.py
@@ -167,6 +180,21 @@ def is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def paths_inside_outputs_problems(job, key):
+    """Every way job[key] is not a non-empty list of stage paths each inside one of the job's outputs."""
+    if not (isinstance(job[key], list) and job[key]):
+        return [f"`{key}` must be a non-empty list of paths inside the outputs"]
+    problems = []
+    outputs = [output for output in job.get("outputs") or [] if isinstance(output, str)]
+    for path in job[key]:
+        problem = stage_relative_path_problem(path)
+        if problem:
+            problems.append(f"`{key}`: {problem}")
+        elif not any(path == output or path.startswith(output.rstrip("/") + "/") for output in outputs):
+            problems.append(f"`{key}`: {path!r} is inside none of the outputs {outputs}")
+    return problems
+
+
 def job_problems(job):
     """Every way this JOB breaks the contract ([] when it keeps it)."""
     if not isinstance(job, dict):
@@ -229,16 +257,13 @@ def job_problems(job):
     if "resume_from" in job:
         if job.get("resumable") is not True:
             problems.append("`resume_from` without `resumable` true: only a resumed attempt reads it")
-        if not (isinstance(job["resume_from"], list) and job["resume_from"]):
-            problems.append("`resume_from` must be a non-empty list of paths inside the outputs")
-        else:
-            outputs = [o for o in job.get("outputs") or [] if isinstance(o, str)]
-            for path in job["resume_from"]:
-                problem = stage_relative_path_problem(path)
-                if problem:
-                    problems.append(f"`resume_from`: {problem}")
-                elif not any(path == output or path.startswith(output.rstrip("/") + "/") for output in outputs):
-                    problems.append(f"`resume_from`: {path!r} is inside none of the outputs {outputs}")
+        problems += paths_inside_outputs_problems(job, "resume_from")
+    if "bring_home_every_s" in job and not (is_number(job["bring_home_every_s"]) and job["bring_home_every_s"] > 0):
+        problems.append(f"`bring_home_every_s` {job['bring_home_every_s']!r} must be a positive number of seconds")
+    if "bring_home" in job:
+        if "bring_home_every_s" not in job:
+            problems.append("`bring_home` without `bring_home_every_s`: podd would never bring them home while it runs")
+        problems += paths_inside_outputs_problems(job, "bring_home")
     if "attempts" in job and not (isinstance(job["attempts"], list) and all(isinstance(a, dict)
                                                                             for a in job["attempts"])):
         problems.append("`attempts` (podd's) must be a list of records")
@@ -286,11 +311,14 @@ def read_config(path=None):
         raise JobContractError(f"(╯°□°)╯ no podd config {path} (README.md, The config, and config.example.json say what goes in it)")
     except json.JSONDecodeError as error:
         raise JobContractError(f"(╯°□°)╯ podd config {path} is not JSON: {error}")
-    config = {**CONFIG_DEFAULTS, **config} if isinstance(config, dict) else config
+    if isinstance(config, dict):
+        config = {**CONFIG_DEFAULTS, **{key: config[source] for key, source in CONFIG_DEFAULTS_FROM_KEYS.items()
+                                        if source in config}, **config}
     problems = [f"no `{key}`" for key in CONFIG_KEYS if key not in config]
     problems += [f"`{key}` is {why}" for key, why in RETIRED_CONFIG_KEYS.items() if key in config]
     problems += [f"unknown key `{key}`" for key in config
-                 if key not in CONFIG_KEYS + tuple(CONFIG_DEFAULTS) + tuple(RETIRED_CONFIG_KEYS)]
+                 if key not in CONFIG_KEYS + tuple(CONFIG_DEFAULTS) + tuple(CONFIG_DEFAULTS_FROM_KEYS)
+                 + tuple(RETIRED_CONFIG_KEYS)]
     if not problems:
         if not (isinstance(config["queue_directories"], list) and config["queue_directories"]
                 and all(isinstance(d, str) and Path(d).is_absolute() for d in config["queue_directories"])):
@@ -302,7 +330,8 @@ def read_config(path=None):
             problems.append(f"`max_pods` must be {{\"gpu\": n, \"cpu\": n}}, positive integers: GPU and CPU pods are "
                             f"capped apart (2026-10-15: hour-long CPU jobs held all 8 shared slots and starved a "
                             f"GPU sweep); got {caps!r}")
-        for key in ("idle_minutes", "max_price_per_hour", "boot_seconds", "max_wait_for_a_pod_minutes"):
+        for key in ("idle_minutes", "max_price_per_hour", "max_cpu_price_per_hour", "boot_seconds",
+                    "max_wait_for_a_pod_minutes"):
             if not (is_number(config[key]) and config[key] > 0):
                 problems.append(f"`{key}` must be a positive number")
         if not (isinstance(config["cards"], list) and config["cards"] and all(

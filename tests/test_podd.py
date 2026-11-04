@@ -14,7 +14,9 @@ while its set waits for a pod), a GPU create sends no allowedCudaVersions, a set
 max_wait_for_a_pod_minutes with no pod, a pod that did not boot is a miss of that same wait (its set's jobs stay queued,
 a create follows the backoff) while a job no pod can hold still fails at once, a container RunPod keeps restarting
 fails the real pod.sh create in seconds (and an answer it does not know, at once), the deadline
-scales with expected_s and the pod's slowness, and podd imports nothing but the standard library.
+scales with expected_s and the pod's slowness, a CPU pod has its own price cap (max_cpu_price_per_hour, the cards' cap
+unless set), a running job's command.log and bring_home files come home every bring_home_every_s (a failed pull is
+loud, never fatal), and podd imports nothing but the standard library.
 
     PYTHONPATH=src /usr/bin/python3 tests/test_podd.py      (from the repo root; or with podd installed)
 """
@@ -266,7 +268,7 @@ def test_a_pool_whose_only_card_is_over_the_cap_opens_nothing_and_says_so():
         (stage / "in").write_text("x")
         podjobs.write_job(stage, a_job())
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS + [{"name": "NVIDIA L40S",
+              "max_price_per_hour": 0.60, "max_cpu_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS + [{"name": "NVIDIA L40S",
                                                                                   "memory_gb": 48}],
               "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
@@ -316,7 +318,7 @@ def test_a_looser_job_does_not_open_a_pod_while_a_pod_that_serves_it_boots():
     (stage / "in").write_text("x")
     podjobs.write_job(stage, a_job(requires={"image": IMAGE_A}))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
+              "max_price_per_hour": 0.60, "max_cpu_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     pool.pods["podd-g1"] = podd.Pod("podd-g1", secrets, a_job()["requires"], config)       # booting, stricter set
@@ -347,7 +349,7 @@ def test_a_job_requiring_an_image_no_running_pod_has_opens_a_pod_for_it():
     (stage / "in").write_text("x")
     podjobs.write_job(stage, a_job(requires={"image": IMAGE_B, "engine": "1.0", "solver_version": 1}))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
+              "max_price_per_hour": 0.60, "max_cpu_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     running_pod = podd.Pod("podd-g1", secrets, a_job()["requires"], config)
@@ -379,7 +381,7 @@ def test_a_pod_whose_facts_do_not_satisfy_its_set_fails_that_sets_jobs_and_is_ne
     (stage / "in").write_text("x")
     podjobs.write_job(stage, a_job(requires={"image": IMAGE_A, "engine": "2.0"}))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 4, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
+              "max_price_per_hour": 0.60, "max_cpu_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS, "min_cuda_version": "12.8"}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
     mismatched = podd.Pod("podd-g1", secrets, {"image": IMAGE_A, "engine": "2.0"}, config)
@@ -414,7 +416,7 @@ def no_pod_pool(root, jobs=6, **config_changes):
         (stage / "in").write_text("x")
         podjobs.write_job(stage, a_job(cpu="all", expected_s=75))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 8, "cpu": 8}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "max_cpu_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", **config_changes}
     pool = podd.Pool(secrets, config)
     pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))      # never pod.sh avail in a test
@@ -1042,7 +1044,7 @@ def test_a_failed_delete_is_retried_and_does_not_stop_podd():
                     "echo 'RunPod DELETE /pods/pod-a -> HTTP 500: unexpected end of JSON input' >&2\nexit $status\n")
     fake.chmod(0o755)
     config = {"queue_directories": [str(root / "queue")], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "max_cpu_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c"]}
     pool = podd.Pool(secrets, config)
     pod = podd.Pod("podd-g1", secrets, a_job()["requires"], config)
@@ -1144,7 +1146,7 @@ def test_a_set_requiring_no_card_opens_a_cpu_pod_through_create_cpu():
         (stage / "in").write_text("x")
         podjobs.write_job(stage, a_cpu_job(expected_s=3000))
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "max_cpu_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c", "cpu5c", "cpu3g"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))   # never pod.sh avail-cpu in a test
@@ -1172,7 +1174,7 @@ def test_gpu_and_cpu_pods_are_capped_apart():
             (stage / "in").write_text("x")
             podjobs.write_job(stage, job)
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 3, "cpu": 2}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "max_cpu_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c", "cpu5c", "cpu3g"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))
@@ -1326,10 +1328,12 @@ class FakeJobPod:
         return subprocess.CompletedProcess(command, 0, "", "")
 
 
-def run_once(stage, job, running, outcome, pulled_raw=("000000", "000001")):
+def run_once(stage, job, running, outcome, pulled_raw=("000000", "000001"), wait_options=None):
     """run_the_job with the pod side simulated: the wait ends with `outcome` (an exception, or an exit), and the pull
-    brings back raw/ holding `pulled_raw` and command.log. -> (pod, every transfer command)."""
+    brings back raw/ holding `pulled_raw` and command.log; wait_options (a dict) gets the wait's keyword arguments.
+    -> (pod, every transfer command)."""
     pod, transfers = FakeJobPod(stage), []
+    wait_options = {} if wait_options is None else wait_options
 
     def fake_pull(pod, remote, at, job):
         (at / "raw").mkdir(exist_ok=True)
@@ -1340,6 +1344,7 @@ def run_once(stage, job, running, outcome, pulled_raw=("000000", "000001")):
         return [path for path in job["outputs"] if not (at / path).exists()]
 
     def wait(*args, **kwargs):
+        wait_options.update(kwargs)
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -1448,7 +1453,7 @@ def slow_pool(root, pods=(("podd-c1", "EU-RO-1"), ("podd-c2", "US-MD-1"))):
     (secrets / podd.PODS_DIRECTORY_NAME).mkdir(parents=True)
     queue_directory.mkdir(parents=True)
     config = {"queue_directories": [str(queue_directory)], "max_pods": {"gpu": 2, "cpu": 4}, "idle_minutes": 3,
-              "max_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
+              "max_price_per_hour": 0.60, "max_cpu_price_per_hour": 0.60, "boot_seconds": 150, "max_wait_for_a_pod_minutes": 60, "cards": CARDS,
               "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c"]}
     pool = podd.Pool(secrets, config)
     pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))
@@ -1716,6 +1721,109 @@ def test_pod_sh_create_avoids_the_slow_datacenters():
     assert "dataCenterIds" not in body, "no avoid list: any datacenter"
     body, said = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "20", "XX-NOWHERE-1")
     assert "not in RUNPOD_DATACENTERS" in said, said
+
+
+# 7b. a CPU pod's own price cap (2026-11-04: at the shared $0.60 a CPU pod stopped at 16 vCPU; a test run wanted 32)
+def test_cpu_pods_have_their_own_price_cap_defaulting_to_the_cards_cap():
+    directory = Path(tempfile.mkdtemp(prefix="podd-cpu-cap-"))
+    path = directory / "config.json"
+    config = {"queue_directories": [str(directory / "queue")], "max_pods": {"gpu": 2, "cpu": 2}, "idle_minutes": 3,
+              "max_price_per_hour": 0.30, "cards": CARDS, "min_cuda_version": "12.8", "cpu_flavors": ["cpu3c"]}
+    path.write_text(json.dumps(config))
+    assert podjobs.read_config(path)["max_cpu_price_per_hour"] == 0.30, "unset: the cards' cap, nothing changes"
+    path.write_text(json.dumps({**config, "max_cpu_price_per_hour": 1.0}))
+    read = podjobs.read_config(path)
+    assert read["max_cpu_price_per_hour"] == 1.0 and read["max_price_per_hour"] == 0.30, read
+    path.write_text(json.dumps({**config, "max_cpu_price_per_hour": 0}))
+    raises(podjobs.JobContractError, lambda: podjobs.read_config(path), "`max_cpu_price_per_hour` must be a positive")
+    # one cpu "all" job of 32 vCPU on cpu3c ($0.96/h): over the cards' $0.30, under the CPU pods' $1.00
+    big_requires = {**CPU_REQUIRES, "cpu_min": 32}
+    pool = podd.Pool(directory / "secrets", {**read, "boot_seconds": 150})
+    pool.cpu_offers = (time.time(), json.loads(json.dumps(CPU_OFFERS)))
+    pool.offers = (time.time(), json.loads(json.dumps(OFFERS)))
+    plan, why = pool.cpu_plan(big_requires, [a_cpu_job(cpu="all", requires=big_requires)])
+    assert why is None and plan["vcpu"] == 32 and plan["price_per_hour"] == 0.96, (plan, why)
+    cards, _ = pool.cards_to_ask({"image": IMAGE_A})
+    assert cards == ["NVIDIA RTX A5000", "NVIDIA RTX A4500"], ("the cards keep their own cap", cards)
+    pool.config = {**pool.config, "max_cpu_price_per_hour": 0.30}
+    plan, why = pool.cpu_plan(big_requires, [a_cpu_job(cpu="all", requires=big_requires)])
+    assert plan is None and "PRICE CAP" in why and "$0.3/h" in why, why
+
+
+# 7c. a running job's command.log (and its bring_home files) come home while it runs: bring_home_every_s
+def test_the_contract_checks_bring_home_every_s_and_bring_home():
+    assert podjobs.job_problems(a_job(bring_home_every_s=10)) == []
+    assert podjobs.job_problems(a_job(outputs=["out", "log"], bring_home_every_s=5, bring_home=["log", "out/a"])) == []
+    for broken, words in ((a_job(bring_home_every_s=0), "`bring_home_every_s` 0 must be a positive"),
+                          (a_job(bring_home_every_s=True), "must be a positive"),
+                          (a_job(bring_home=["out"]), "`bring_home` without `bring_home_every_s`"),
+                          (a_job(bring_home_every_s=5, bring_home=["elsewhere"]), "inside none of the outputs"),
+                          (a_job(bring_home_every_s=5, bring_home=[]), "non-empty list"),
+                          (a_job(bring_home_every_s=5, bring_home=["../out"]), "not inside the stage")):
+        problems = podjobs.job_problems(broken)
+        assert any(words in problem for problem in problems), (words, problems)
+
+
+def test_the_wait_brings_files_home_every_n_seconds_while_the_job_runs_and_not_after_its_exit():
+    clock, brought = FakeClock(), []
+    running = [ok("")] * 10 + [ok('{"exit_status": 0, "wall_s": 22}\n')]     # a read every POLL_SECONDS (2 s)
+    exited = podd.wait_for_the_exit(reads(*running), deadline_s=100, sleep=clock.sleep, clock=clock,
+                                    bring_home=lambda: brought.append(clock.now), bring_home_every_s=5)
+    assert exited == {"exit_status": 0, "wall_s": 22} and brought == [6.0, 12.0, 18.0], brought
+    clock, brought = FakeClock(), []
+    podd.wait_for_the_exit(reads(*running), deadline_s=100, sleep=clock.sleep, clock=clock)
+    assert brought == [], "off without bring_home"
+
+
+def test_bringing_home_while_it_runs_pulls_the_log_and_the_named_files_and_a_failure_is_loud_never_fatal():
+    stage = Path(tempfile.mkdtemp(prefix="podd-live-"))
+    pod, ran = FakeJobPod(stage), []
+    job = a_job(outputs=["out", "progress.txt"], bring_home_every_s=5, bring_home=["progress.txt"])
+    answers = [subprocess.CompletedProcess([], 0, "", ""),
+               subprocess.CompletedProcess([], 12, "", "rsync: connection unexpectedly closed"),
+               subprocess.TimeoutExpired("rsync", podd.BRING_HOME_TIMEOUT_S)]
+
+    def fake_run(command, **options):
+        ran.append((command, options))
+        answer = answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+    saved = podd.subprocess.run
+    podd.subprocess.run = fake_run
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            outcomes = [podd.bring_home_while_running(pod, "/workspace/jobs/x", stage, job) for _ in range(3)]
+    finally:
+        podd.subprocess.run = saved
+    assert outcomes == [True, False, False], outcomes
+    command, options = ran[0]
+    assert command == ["rsync", "-rtR", "--ignore-missing-args", "runpod-podd-c1:/workspace/jobs/x/./command.log",
+                       "runpod-podd-c1:/workspace/jobs/x/./progress.txt", f"{stage}/"], command
+    assert options["timeout"] == podd.BRING_HOME_TIMEOUT_S
+    assert said.getvalue().count("(╯°□°)╯") == 2 and "connection unexpectedly closed" in said.getvalue() \
+        and "TimeoutExpired" in said.getvalue(), said.getvalue()
+
+
+def test_run_the_job_hands_the_wait_a_bring_home_only_when_the_job_asks_for_one():
+    pulled = []
+    saved = podd.bring_home_while_running
+    podd.bring_home_while_running = lambda pod, remote, stage, job: pulled.append((pod.name, remote, stage, job))
+    try:
+        for job, every_s in ((a_cpu_job(outputs=["raw", "solve.log"]), None),
+                             (a_cpu_job(outputs=["raw", "solve.log"], bring_home_every_s=7, bring_home=["solve.log"]),
+                              7)):
+            stage, options = a_running_stage(job), {}
+            run_once(stage, job, a_running(stage, job), {"exit_status": 0, "wall_s": 1}, wait_options=options)
+            assert podjobs.stage_state(stage) == podjobs.DONE, list(stage.iterdir())
+            assert options["bring_home_every_s"] == every_s, options
+            if every_s is None:
+                assert options["bring_home"] is None, options
+            else:
+                options["bring_home"]()
+                assert pulled == [("podd-c1", podd.remote_directory(stage), stage, job)], pulled
+    finally:
+        podd.bring_home_while_running = saved
 
 
 # 8. podd is anyone's: every module imports the standard library and podd itself, nothing else (a hard rule)

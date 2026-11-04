@@ -51,8 +51,10 @@ pod.sh, no ssh, no rsync.
 - `max_pods`: `{"gpu": n, "cpu": n}`, GPU and CPU pods capped apart (2026-10-15: hour-long CPU jobs held all 8 shared
   slots and starved a GPU sweep).
 - `idle_minutes`: a ready pod with no job this long is deleted.
-- `max_price_per_hour`: a card (or a CPU pod's flavor x vCPUs) over it is never asked for (`pod.sh avail`: RunPod's
-  securePrice and stock). create is offered EVERY accepted card under it, listed-in-stock first, cheapest first.
+- `max_price_per_hour`: a card over it is never asked for (`pod.sh avail`: RunPod's securePrice and stock). create is
+  offered EVERY accepted card under it, listed-in-stock first, cheapest first.
+- `max_cpu_price_per_hour` (default: `max_price_per_hour`): a CPU pod (flavor x vCPUs) over it is never asked for
+  (2026-11-04: at a shared $0.60 a CPU pod stopped at 16 vCPU of cpu3c; a test run wanted 32, $0.96/h).
 - `cards`: the cards a GPU pod may be, each with RunPod's own `gpuTypes.memoryInGb`.
 - `min_cuda_version` (e.g. `"12.8"`): the lowest driver CUDA version (nvidia-smi's "CUDA Version") your images run.
   A GPU create asks RunPod for ANY host (its `allowedCudaVersions` enum stops at 13.0, so a list shut out every newer
@@ -85,6 +87,7 @@ pod.sh, no ssh, no rsync.
                                      "label": "..."}
     a job that can resume also:     "progress": "progress", "resumable": true,
                                      "resume_from": ["result/manifest.json", "solve.log"]
+    a job whose log streams home:   "bring_home_every_s": 10, "bring_home": ["solve.log"]
 
 `JOB` -> `RUNNING` (podd claimed it) -> `DONE` (+ `used`: the pod's facts, + `timings`: ship_bytes, ship_s, wait_s,
 command_wall_s, pull_s) or `FAILED` (why, the traceback, command.log's tail), or back to `JOB` (a resumable job podd
@@ -115,9 +118,15 @@ stopped part-way, + a record in `attempts`).
   files brought up to date, never needs a finished unit's file on the pod, and never leaves on the pod a file that
   would be wrong laid over the stage.
 
+- `bring_home_every_s` (optional): while the command runs, podd brings `command.log` (and the `bring_home` files, paths
+  inside the outputs, those that exist yet) home into the stage this often (at the 2 s exit poll's pace at the
+  fastest; rsync renames each into place, so a reader never sees half a file). A client streams the job by reading
+  them in the stage. Off without it; a pull that fails is said in the journal and the job runs on (the pull after the
+  exit is the one that counts). Keep the files small: they cross this machine's link every time.
+
 A CPU job (`requires.gpu: "none"`, `gpu_memory_gb` 0) runs on a CPU pod that podd sizes from the set's waiting jobs
 (`cpu_pod_plan`: as many of them as one pod holds by `cpu` and `ram_gb`, vCPUs a power of two, under
-`max_price_per_hour`, the flavor cheapest per job) and creates with `pod.sh create-cpu`.
+`max_cpu_price_per_hour`, the flavor cheapest per job) and creates with `pod.sh create-cpu`.
 
 ## Images
 
@@ -138,6 +147,8 @@ On pod `<name>` (`J=/workspace/jobs/<digest>-<stage>`):
     ssh runpod-<name> "cat > $J/.podd/command"                          # the JOB's command, on stdin
     ssh runpod-<name> "nohup setsid bash /workspace/podd/podd-run.sh $J >/dev/null 2>&1 < /dev/null &"
     ssh runpod-<name> cat $J/.podd/exit [; cat $J/<progress>]          # every 2 s, until {"exit_status", "wall_s"}
+    [rsync -rtR --ignore-missing-args runpod-<name>:$J/./command.log [runpod-<name>:$J/./<bring_home>...] <stage>/]
+                                                                        # every bring_home_every_s while it runs
     rsync -rtR runpod-<name>:$J/./<output>... runpod-<name>:$J/./command.log <stage>/      # laid over: no --delete
     ssh runpod-<name> rm -rf $J
 

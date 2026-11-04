@@ -14,7 +14,8 @@ can leak a pod.
         v
   <queue directory>/<stage>/        THE CONTRACT (src/podd/job_contract.py): one directory per job, one state file
         |   JOB                     command, inputs, outputs, requires, cpu, gpu_memory_gb, expected_s (+ ram_gb,
-        |                           progress, resumable, resume_from, label): the client; podd again when it
+        |                           progress, resumable, resume_from, bring_home_every_s, bring_home, label): the
+        |                           client; podd again when it
         |                           requeues (+ attempts)
         |   RUNNING                 podd claimed it (rename) for one pod (that pod's facts in it)
         |   DONE | FAILED           + used (what it ran on) + timings | why, the traceback, command.log's tail
@@ -67,7 +68,8 @@ THE PATTERN.
   Another pod is opened only while a requirement set's backlog would take longer than boot_seconds to drain on the
   pods up or booting, up to max_pods of the set's kind (GPU and CPU pods capped apart), and only on a card under
   max_price_per_hour (2026-10-14: a second pod, an L40S, came up after six jobs were done: $0.032 a job instead of
-  $0.011). create is offered EVERY accepted card under the cap (listed-in-stock first, cheapest first); RunPod rents
+  $0.011); a CPU pod only under max_cpu_price_per_hour (default: the same; 2026-11-04: the shared cap stopped CPU pods
+  at 16 vCPU). create is offered EVERY accepted card under the cap (listed-in-stock first, cheapest first); RunPod rents
   the first it has. `cpu: "all"` runs ALONE on its pod (2026-10-13: three CPU-bound jobs at once on a 7.65-CPU quota
   took 152-223 s each against 75 s alone).
 - A job that needs no card says so (`requires.gpu: "none"`) and runs on a CPU pod, sized from the set's jobs (cpu,
@@ -84,6 +86,9 @@ THE PATTERN.
   that wait's rule, the boot failure's reason in its list of misses. One wait (NoPodWait) for every way a set gets no
   pod: no stock, no card under the cap, an old driver, no boot. A job no pod can ever run (no pod size holds it, a pod
   opened for its set did not satisfy it) still FAILS at once.
+- A client watches a running job only through its stage: a job that asks (`bring_home_every_s`) gets command.log and
+  its `bring_home` files laid over the stage while it runs, from the job's own thread at the exit poll; never an ssh
+  of the client's. A failed pull is said and the job runs on: the pull after the exit decides.
 - Nothing fails quietly: every failure is a FAILED file (and the journal for podd's); a stage that failed stays until
   a person reads it and deletes it by name. A failure on one pod fails only its jobs; a pod whose ssh or rsync failed
   is BROKEN: it takes no more jobs and is deleted once empty. A job's own failure (non-zero exit, a missing output) is

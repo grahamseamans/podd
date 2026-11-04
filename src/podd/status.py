@@ -12,7 +12,8 @@ def print_status():
         print(f"pods: podd never wrote {daemon.STATUS_FILE}")
     else:
         print(f"pods ({len(status['pods'])}; at most {status['max_pods']['gpu']} GPU and {status['max_pods']['cpu']} "
-              f"CPU, cards at most ${status['max_price_per_hour']}/h; as of {status['written_at']}):")
+              f"CPU, cards at most ${status['max_price_per_hour']}/h, CPU pods at most "
+              f"${status.get('max_cpu_price_per_hour', status['max_price_per_hour'])}/h; as of {status['written_at']}):")
         for pod in status["pods"]:
             facts = pod.get("facts") or {}
             price = f"${facts['cost_per_hr']}/h" if facts.get("cost_per_hr") else ""

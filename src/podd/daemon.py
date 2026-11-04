@@ -12,7 +12,7 @@ queue_directories (absolute paths; each subdirectory is a stage), max_pods ({"gp
 pods are capped apart, 2026-10-15), idle_minutes, max_price_per_hour, cards (the cards a pod may
 be, each {name, memory_gb}), min_cuda_version (the lowest driver CUDA version a GPU pod may have), cpu_flavors, and,
 with defaults,
-boot_seconds (150) and max_wait_for_a_pod_minutes (60).
+boot_seconds (150), max_wait_for_a_pod_minutes (60) and max_cpu_price_per_hour (a CPU pod's cap: max_price_per_hour).
 
 A POD'S FACTS, read ONCE when it boots: /etc/podd-facts.json (what its image declares: README.md "Images";
 a pod without it is refused), the image tag podd launched it from, nvidia-smi's card name and memory (decimal GB; a
@@ -47,7 +47,7 @@ CPU PODS. A set with requires.gpu "none" runs on a pod with no card: RunPod's
 computeType CPU, one of the config's cpu_flavors (cpu3c, cpu5c, ...: price per vCPU-hour and RAM per vCPU from pod.sh
 avail-cpu), its vcpuCount a power of two. cpu_pod_plan sizes it from the set's waiting jobs: as many of them as one
 pod of the flavor holds (by cpu and ram_gb, and enough vCPUs for its container disk at CPU_DISK_GB_PER_VCPU; at most
-its vcpu_max, under max_price_per_hour), the flavor whose price
+its vcpu_max, under max_cpu_price_per_hour), the flavor whose price
 per job is the lowest; create is offered every flavor that holds the same jobs at that vcpuCount, listed-in-stock
 first, cheapest first. A booting CPU pod's capacity is that plan. Facts, packing, idling and stock are the GPU pods'.
 NO POD YET IS NOT A FAILURE. pod.sh create exits POD_SH_NO_STOCK_EXIT when RunPod has no instance of any card
@@ -87,7 +87,8 @@ fail (SHUTDOWN_PULL_SECONDS), then deletes its pods.
 
 ONE JOB: ship its inputs (rsync; a resumable job's `resume_from` files too, never the rest of what came home), write
 its command to <job>/.podd/command, start podd-run.sh under `nohup setsid` (the job's own session), poll
-<job>/.podd/exit (and its `progress` file, when it has one), pull its outputs (each laid over the stage's copy: no file
+<job>/.podd/exit (and its `progress` file, when it has one; with `bring_home_every_s`, command.log and its `bring_home`
+files come home that often while it runs: bring_home_while_running), pull its outputs (each laid over the stage's copy: no file
 of the stage is deleted) and command.log, then DONE (with `used`, the pod's facts, and
 `timings`) or FAILED. A non-zero exit or a missing output fails the job, not the pod.
 THE DEADLINE (job_deadline_s; 2026-10-16: a fixed 6 h timeout killed four jobs on slow hosts at 103-109 of 115
@@ -197,6 +198,8 @@ NO_POD_RETRY_MAX_SECONDS = 600        # at most this; the set's jobs stay JOB un
 DELETE_RETRY_SECONDS = 60           # a pod whose delete failed is deleted again this often (Pool.forget)
 SSH_FAILURES_ALLOWED = 3             # consecutive failed exit polls that fail the job
 SSH_COMMAND_TIMEOUT_S = 600          # one ssh / rsync; a hung connection is a failure, never a hang
+BRING_HOME_TIMEOUT_S = 60            # one pull of a running job's command.log / bring_home files (it holds up the exit
+                                     # poll: a small file, never the 600 s of a whole transfer)
 
 STATUS_FILE = Path.home() / ".local" / "state" / "podd" / "PODS.json"
 # {kind: {datacenter: {"until_unix", "until", "why", "pod", "because"}}}: the datacenters podd's creates avoid,
@@ -514,14 +517,14 @@ def container_disk_gb(requires):
     return max(default, math.ceil(requires.get("disk_gb_min", 0)))
 
 
-def cpu_pod_plan(jobs, requires, flavors, offers, max_price_per_hour, vcpu_ceiling=None):
+def cpu_pod_plan(jobs, requires, flavors, offers, max_cpu_price_per_hour, vcpu_ceiling=None):
     """THE CPU POD'S SIZE (pure). jobs: the set's waiting jobs; flavors: the config's cpu_flavors; offers: pod.sh
     avail-cpu's JSON ({flavor: {price_per_vcpu_hour, ram_gb_per_vcpu, vcpu_min, vcpu_max, stock} or null}) ->
     ({vcpu, flavors, jobs_per_pod, capacity, price_per_hour}, None) or (None, why). Per flavor: k of the jobs (the
     largest cpu and ram_gb of them each; a cpu "all" job alone, sized by cpu_min) fit vcpu = the power of two at least
     max(k x cpu, k x ram_gb / ram_gb_per_vcpu, cpu_min, container_disk_gb / CPU_DISK_GB_PER_VCPU, vcpu_min); k as many
     as are waiting, fewer while vcpu exceeds
-    vcpu_max or the price max_price_per_hour. The plan is the flavor with the lowest price per job (then more jobs a
+    vcpu_max or the price max_cpu_price_per_hour (the config's CPU cap). The plan is the flavor with the lowest price per job (then more jobs a
     pod, then in stock, then the config's order); create is offered every flavor that holds those k jobs at that vcpu
     under the cap, listed-in-stock first, cheapest first (RunPod rents the first it has: cpuFlavorPriority custom).
     vcpu_ceiling: after RunPod refused a size for stock, pods of at most this many vCPUs (never below one job's
@@ -552,12 +555,12 @@ def cpu_pod_plan(jobs, requires, flavors, offers, max_price_per_hour, vcpu_ceili
             continue
         count = 1 if alone else len(jobs)
         while count >= 1 and (size(offer, count) > largest(offer)
-                              or size(offer, count) * offer["price_per_vcpu_hour"] > max_price_per_hour + 1e-9):
+                              or size(offer, count) * offer["price_per_vcpu_hour"] > max_cpu_price_per_hour + 1e-9):
             count -= 1
         if count < 1:
             misses.append(f"{flavor}: one job needs {size(offer, 1)} vCPU, "
                           f"${size(offer, 1) * offer['price_per_vcpu_hour']:.3f}/h (at most {offer['vcpu_max']} "
-                          f"vCPU, ${max_price_per_hour}/h)")
+                          f"vCPU, ${max_cpu_price_per_hour}/h)")
             continue
         vcpu = size(offer, count)
         price = vcpu * offer["price_per_vcpu_hour"]
@@ -569,7 +572,7 @@ def cpu_pod_plan(jobs, requires, flavors, offers, max_price_per_hour, vcpu_ceili
     _, best, vcpu, count = min(candidates)
     offered = [flavor for flavor in flavors if offers.get(flavor) and size(offers[flavor], count) <= vcpu
                and vcpu <= largest(offers[flavor])
-               and vcpu * offers[flavor]["price_per_vcpu_hour"] <= max_price_per_hour + 1e-9]
+               and vcpu * offers[flavor]["price_per_vcpu_hour"] <= max_cpu_price_per_hour + 1e-9]
     offered.sort(key=lambda flavor: (flavor != best, not offers[flavor]["stock"],
                                      offers[flavor]["price_per_vcpu_hour"]))
     ram_gb = min(vcpu * offers[flavor]["ram_gb_per_vcpu"] for flavor in offered)
@@ -661,13 +664,17 @@ def cpu_of(cpu_text):
 
 
 def wait_for_the_exit(read_exit, deadline_s, poll_s=POLL_SECONDS, sleep=time.sleep, clock=time.monotonic,
-                      stop=lambda: None, saw_progress=lambda text, now: None):
+                      stop=lambda: None, saw_progress=lambda text, now: None, bring_home=None,
+                      bring_home_every_s=None):
     """Poll until the job's .podd/exit exists; returns its JSON. read_exit() -> CompletedProcess of the ssh (stdout
     the file, or empty while it runs; then PROGRESS_MARK and the progress file, when the job has one: saw_progress
     gets it). deadline_s: seconds, or a function of nothing (re-read every poll: the pod's slowness moves it). Ends,
     loudly, at the deadline (JobTimedOut: the caller kills the job), when stop() names a (kind, why) (JobStopped), or
-    after SSH_FAILURES_ALLOWED failed reads in a row (PodError)."""
+    after SSH_FAILURES_ALLOWED failed reads in a row (PodError). bring_home: called (no arguments) after a read that
+    found the job still running, once bring_home_every_s have passed since the start or its last call (the job's
+    `bring_home_every_s`: bring_home_while_running)."""
     started, failures_in_a_row = clock(), 0
+    brought_home_at = started
     deadline = deadline_s if callable(deadline_s) else (lambda: deadline_s)
     while True:
         if clock() - started > deadline():
@@ -692,6 +699,9 @@ def wait_for_the_exit(read_exit, deadline_s, poll_s=POLL_SECONDS, sleep=time.sle
             saw_progress(progress_text.strip(), clock())
         if exit_text.strip():
             return json.loads(exit_text)
+        if bring_home is not None and clock() - brought_home_at >= bring_home_every_s:
+            bring_home()
+            brought_home_at = clock()
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -907,6 +917,29 @@ def pull_back(pod, remote, stage, job):
     return [path for path in job["outputs"] if path not in present]
 
 
+def bring_home_while_running(pod, remote, stage, job):
+    """A RUNNING job's command.log and its `bring_home` files (those that exist yet) into the stage, laid over the
+    stage's copies (rsync renames each into place: a client streaming them never reads half a file), at most
+    BRING_HOME_TIMEOUT_S. Never raises: a pull that fails is said loudly and the job runs on (the pull after the exit
+    is the one that counts). -> True when it came home."""
+    paths = [job_contract.COMMAND_LOG] + list(job.get("bring_home") or [])
+    command = ["rsync", "-rtR", "--ignore-missing-args", *[f"{pod.ssh_alias}:{remote}/./{path}" for path in paths],
+               f"{stage}/"]
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True, stdin=subprocess.DEVNULL,
+                                   timeout=BRING_HOME_TIMEOUT_S)
+    except Exception as error:
+        say(f"(╯°□°)╯ {job.get('label') or stage.name}: bringing {paths} home while it runs failed "
+            f"({type(error).__name__}: {error}); it runs on, its next pull is in bring_home_every_s")
+        return False
+    if completed.returncode != 0:
+        say(f"(╯°□°)╯ {job.get('label') or stage.name}: bringing {paths} home while it runs failed (rsync exit "
+            f"{completed.returncode}: {completed.stderr.strip()[-300:]}); it runs on, its next pull is in "
+            f"bring_home_every_s")
+        return False
+    return True
+
+
 def bytes_under(stage, paths):
     """The bytes of these stage paths (files, directories whole): what a ship sends up this machine's uplink."""
     total = 0
@@ -964,7 +997,9 @@ def run_the_job(stage, job, pod, running):
             ["ssh", pod.ssh_alias, read + "true"],
             text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=SSH_COMMAND_TIMEOUT_S),
             deadline_s=lambda: job_deadline_s(job, pod.slowness, running.peak_load),
-            stop=lambda: running.stop, saw_progress=running.saw_progress)
+            stop=lambda: running.stop, saw_progress=running.saw_progress,
+            bring_home=(lambda: bring_home_while_running(pod, remote, stage, job)) if "bring_home_every_s" in job
+            else None, bring_home_every_s=job.get("bring_home_every_s"))
         started = False                                   # it exited: nothing left to kill
         timings["wait_s"] = round(time.time() - waiting_started_s, 1)
         timings["command_wall_s"] = exited["wall_s"]
@@ -1352,7 +1387,8 @@ class Pool:
                               f"prices could not be read)")
             self.cpu_offers = (time.time(), json.loads(asked.stdout))
         return cpu_pod_plan(jobs, requires, self.config["cpu_flavors"], self.cpu_offers[1],
-                            self.config["max_price_per_hour"], self.cpu_vcpu_ceiling.get(requirement_key(requires)))
+                            self.config["max_cpu_price_per_hour"],
+                            self.cpu_vcpu_ceiling.get(requirement_key(requires)))
 
     def no_pod_miss(self, key, attempt, why):
         """RunPod gave the set no pod (its create was refused for stock, no card is under the cap, its pod landed on an
@@ -1552,6 +1588,7 @@ class Pool:
 
     def write_status(self):
         status = {"max_pods": self.config["max_pods"], "max_price_per_hour": self.config["max_price_per_hour"],
+                  "max_cpu_price_per_hour": self.config["max_cpu_price_per_hour"],
                   "queue_directories": self.config["queue_directories"], "pods": [
                       {"name": pod.name, "state": pod.state, "problem": pod.problem, "requires": pod.requires,
                        "facts": pod.facts, "slowness": pod.slowness,
@@ -1661,7 +1698,7 @@ def run_forever():
     config = job_contract.read_config()
     say(f"up ({job_contract.CONFIG_PATH}): queues {config['queue_directories']}, up to "
         f"{config['max_pods']['gpu']} GPU and {config['max_pods']['cpu']} CPU pods, cards at "
-        f"most ${config['max_price_per_hour']}/h, another pod only when the backlog drains in more than "
+        f"most ${config['max_price_per_hour']}/h, CPU pods at most ${config['max_cpu_price_per_hour']}/h, another pod only when the backlog drains in more than "
         f"{config['boot_seconds']} s, a pod deleted after {config['idle_minutes']} idle min")
     for stage, state, _ in queue(config["queue_directories"]):
         if state == RUNNING:
