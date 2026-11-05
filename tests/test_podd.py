@@ -942,9 +942,9 @@ def pod_sh_create_against(rest_pod_answers, graphql_answers, ssh_answers):
     --fail-with-body does on an HTTP error); ssh_answers: whether `ssh <alias> true` gets in, in turn (the last
     repeats). -> (the finished process, the seconds it took)."""
     root = Path(tempfile.mkdtemp(prefix="podsh-container-"))
-    (root / ".secrets").mkdir(mode=0o700)
-    (root / ".secrets" / "runpod_api_key").write_text("not-a-key\n")
-    (root / ".secrets" / "runpod_ssh_ed25519").write_text("not-a-key\n")
+    (root / ".secrets" / "runpod").mkdir(mode=0o700, parents=True)
+    (root / ".secrets" / "runpod" / "api_key").write_text("not-a-key\n")
+    (root / ".secrets" / "runpod" / "ssh_ed25519").write_text("not-a-key\n")
     (root / "bin").mkdir()
     (root / "rest-pod-answers").write_text("".join(answer + "\n" for answer in rest_pod_answers))
     (root / "graphql-answers").write_text("".join(answer + "\n" for answer in graphql_answers))
@@ -988,7 +988,7 @@ def pod_sh_create_against(rest_pod_answers, graphql_answers, ssh_answers):
                                   "30"], capture_output=True, text=True, env=environment, stdin=subprocess.DEVNULL,
                                  timeout=120)
     finally:   # the watchdog pod.sh armed ends once no pod is recorded under the name (within its 60 s sleep)
-        (root / ".secrets" / "runpod_pods" / "podd-z.id").unlink(missing_ok=True)
+        (root / ".secrets" / "runpod" / "pods" / "podd-z.id").unlink(missing_ok=True)
     return created, time.time() - started_s
 
 
@@ -1197,8 +1197,8 @@ def test_pod_sh_create_cpu_asks_runpod_for_a_cpu_pod_of_the_flavors_and_vcpu():
     """The REAL pod.sh create-cpu against a fake curl (first on PATH) that records the request and answers RunPod's
     no-instances 500: pod.sh exits 75 and the body it sent is the CPU PodCreateInput."""
     root = Path(tempfile.mkdtemp(prefix="podsh-cpu-"))
-    (root / ".secrets").mkdir(mode=0o700)
-    (root / ".secrets" / "runpod_api_key").write_text("not-a-key\n")
+    (root / ".secrets" / "runpod").mkdir(mode=0o700, parents=True)
+    (root / ".secrets" / "runpod" / "api_key").write_text("not-a-key\n")
     (root / "bin").mkdir()
     fake_curl = root / "bin" / "curl"
     fake_curl.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$HOME/curl-args\"\n"
@@ -1685,8 +1685,8 @@ def test_pod_sh_create_avoids_the_slow_datacenters():
     """The REAL pod.sh create and create-cpu against a fake curl: an avoid list sends RunPod's datacenters less those;
     none sends no dataCenterIds (any datacenter)."""
     root = Path(tempfile.mkdtemp(prefix="podsh-avoid-"))
-    (root / ".secrets").mkdir(mode=0o700)
-    (root / ".secrets" / "runpod_api_key").write_text("not-a-key\n")
+    (root / ".secrets" / "runpod").mkdir(mode=0o700, parents=True)
+    (root / ".secrets" / "runpod" / "api_key").write_text("not-a-key\n")
     (root / "bin").mkdir()
     fake_curl = root / "bin" / "curl"
     fake_curl.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$HOME/curl-args\"\n"

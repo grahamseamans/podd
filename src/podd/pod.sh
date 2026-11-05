@@ -7,7 +7,7 @@
 # references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json PodCreateInput). No volume: the pod's own disk holds a
 # job while it runs and podd pulls results home, so a pod can be in ANY datacenter on the first free card (user,
 # 2026-10-05: "we made the image, we don't care what datacenter"). Reads the API key from $SECRETS
-# (secrets.sh, the one place) and keeps each pod's files in $SECRETS/runpod_pods/.
+# (secrets.sh, the one place) and keeps each pod's files in $SECRETS/pods/.
 #
 #   pod.sh avail <cards>         # JSON: each card's $/h and the datacenters stocking it now
 #   pod.sh create <name> <image> <cards> <min vCPU> <disk GB> [<avoid datacenters>]
@@ -37,11 +37,12 @@
 set -euo pipefail
 
 source "$(dirname "$0")/secrets.sh"
-PODS_DIRECTORY=$SECRETS/runpod_pods
+PODS_DIRECTORY=$SECRETS/pods
+WATCHDOG_LOG_FILE=$HOME/.local/state/podd/pod-watchdog.log   # a log, not a secret: beside PODS.json
 API=https://rest.runpod.io/v1
-[ -s $SECRETS/runpod_api_key ] || { echo "pod.sh: no API key in $SECRETS/runpod_api_key" >&2; exit 1; }
+[ -s $SECRETS/api_key ] || { echo "pod.sh: no API key in $SECRETS/api_key" >&2; exit 1; }
 # The key reaches curl only through a header file (curl -H @file); printf is a builtin, so it is never in any argv.
-auth() { printf 'Authorization: Bearer %s\n' "$(<$SECRETS/runpod_api_key)"; }
+auth() { printf 'Authorization: Bearer %s\n' "$(<$SECRETS/api_key)"; }
 
 rest() {  # rest <method> <path> [json-body]; fails loudly on any non-2xx, printing RunPod's body
   local out code
@@ -173,7 +174,7 @@ watch_the_container() {
 # container disk + datacenter, wait for ssh, write the alias. GPU and CPU pods alike (create, create-cpu).
 create_the_pod() {
   local body=$2 t0 created pod lease_s cost_per_hr machine datacenter memory_gb container_disk_gb
-  mkdir -p -m 700 $PODS_DIRECTORY
+  mkdir -p -m 700 $PODS_DIRECTORY && mkdir -p "${WATCHDOG_LOG_FILE%/*}"
   [ ! -s $POD_ID_FILE ] || { echo "pod.sh: a pod named $NAME is recorded already: $(pod_id) (pod.sh delete $NAME first)" >&2; exit 1; }
   t0=$(date +%s)
   created=$(rest POST /pods "$body")
@@ -189,7 +190,7 @@ create_the_pod() {
       if [ \$(( \$(date +%s) - \$(stat -c %Y $POD_LEASE_FILE 2>/dev/null || echo 0) )) -ge $lease_s ]; then \
         echo \"pod.sh watchdog: pod $NAME ($pod)'s lease ($POD_LEASE_FILE) is ${MAX_POD_HOURS:-2} h old, deleting it\"; \
         '$0' delete '$NAME'; exit; fi; sleep 60; done" \
-    >> $SECRETS/pod-watchdog.log 2>&1 &
+    >> "$WATCHDOG_LOG_FILE" 2>&1 &
   echo "pod $NAME ($pod): watchdog armed, deleted ${MAX_POD_HOURS:-2} h (MAX_POD_HOURS) after its lease was last renewed"
   # the price is on the create response (Pod.costPerHr); the datacenter is on the pod's machine, which GET /pods/{id}
   # returns only with includeMachine=true (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json)
@@ -246,7 +247,7 @@ pod_id() { [ -s $POD_ID_FILE ] || { echo "pod.sh: no pod named $NAME ($POD_ID_FI
 # ssh_config write|remove: pod.sh owns the whole Host $SSH_ALIAS block of ~/.ssh/config
 ssh_config() {
   mkdir -p -m 700 "$HOME/.ssh"
-  python3 - "$1" "$HOME/.ssh/config" "$SSH_ALIAS" "${2:-}" "${3:-}" "$SECRETS/runpod_ssh_ed25519" <<'EOF'
+  python3 - "$1" "$HOME/.ssh/config" "$SSH_ALIAS" "${2:-}" "${3:-}" "$SECRETS/ssh_ed25519" <<'EOF'
 import os, re, sys
 mode, path, alias, ip, port, key = sys.argv[1:]
 text = open(path).read() if os.path.exists(path) else ""
@@ -300,7 +301,7 @@ create)
   # Jupyter); containerDiskInGb <disk GB>, podd's default 30 (daemon.py GPU_CONTAINER_DISK_GB; more when a job's
   # requires.disk_gb_min asks: the image does not count against it: / showed 16 MB used with /opt at 5.7 GB,
   # 2026-10-04); volumeInGb 0 (no pod volume: results come home); env {}: no PUBLIC_KEY, so RunPod injects the
-  # account's ssh keys ($SECRETS/runpod_ssh_ed25519.pub is one of them); no dockerEntrypoint/StartCmd: the image's.
+  # account's ssh keys ($SECRETS/ssh_ed25519.pub is one of them); no dockerEntrypoint/StartCmd: the image's.
   # NO allowedCudaVersions: its enum stops at 13.0 (PodCreateInput), so any list of versions shuts out every host with
   # a newer driver (2026-10-29: the only stock under the cap was there; every create "no instances" for 30+ min, and
   # created at once without the field). podd measures the driver on the pod and deletes one below min_cuda_version
@@ -373,7 +374,7 @@ ssh-config)
   # ControlMaster/ControlPersist make every later ssh/scp/rsync a channel on it (~1.5 s of handshake each before, nine
   # per job; PLANS/2026-10-13-pod-manager.md); %C is per host and port, so each pod has its own master.
   name_the_pod "${2:-}"
-  [ -s $SECRETS/runpod_ssh_ed25519 ] || { echo "pod.sh: no ssh key $SECRETS/runpod_ssh_ed25519" >&2; exit 1; }
+  [ -s $SECRETS/ssh_ed25519 ] || { echo "pod.sh: no ssh key $SECRETS/ssh_ed25519" >&2; exit 1; }
   pod=$(pod_id)
   read -r ip port < <(rest GET /pods/$pod | field 'd["publicIp"] + " " + str(d["portMappings"]["22"])')
   ssh_config write "$ip" "$port"

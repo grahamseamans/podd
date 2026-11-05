@@ -13,7 +13,7 @@ pod), brings the outputs home, and writes back what it ran on. It knows nothing 
 ## Install
 
     git clone <this repo> ~/podd                               # the unit expects ~/podd (else edit its PYTHONPATH)
-    mkdir -m 700 -p ~/.secrets && $EDITOR ~/.secrets/runpod_api_key        # src/podd/secrets.sh says what goes there
+    mkdir -m 700 -p ~/.secrets/runpod && $EDITOR ~/.secrets/runpod/api_key  # src/podd/secrets.sh says what goes there
     mkdir -p ~/.config/podd && cp ~/podd/config.example.json ~/.config/podd/config.json && $EDITOR ~/.config/podd/config.json
     ln -sf ~/podd/systemd/podd.service ~/.config/systemd/user/ && systemctl --user daemon-reload &&
         systemctl --user enable --now podd
@@ -159,9 +159,9 @@ pulls back what exists, and requeues or FAILS the job.
 ## The pods: pod.sh
 
 `src/podd/pod.sh` drives the RunPod API, each pod by NAME (podd names them podd-g1 .. podd-g<max_pods.gpu> and
-podd-c1 .. podd-c<max_pods.cpu>). The key comes from `$SECRETS` (`src/podd/secrets.sh`: `~/.secrets` unless
+podd-c1 .. podd-c<max_pods.cpu>). The key comes from `$SECRETS` (`src/podd/secrets.sh`: `~/.secrets/runpod` unless
 `$PODD_SECRETS`) and reaches curl only through a header file, never argv; each pod's id, price and lease are in
-`$SECRETS/runpod_pods/<name>.*`:
+`$SECRETS/pods/<name>.*`:
 
     pod.sh avail <cards>                 # JSON: each card's $/h and the datacenters stocking it now
     pod.sh create <name> <image> <cards> <min vCPU> <disk GB> [<avoid datacenters>]   # podd's call
@@ -188,7 +188,8 @@ the pod has work): the backstop for a podd that died.
 | `~/.config/podd/config.json` | the config (read once, at start) |
 | `~/.local/state/podd/PODS.json` | the pool, rewritten whenever it changes (no secrets); `podd status` prints it |
 | `~/.local/state/podd/avoided-datacenters.json` | `{"gpu" \| "cpu": {datacenter: {..., "because": "slow" \| "old driver"}}}`: datacenters that kind's creates avoid: a SLOW pod's for `SLOW_DATACENTER_HOURS` unless the set is waiting for a pod, an old driver's (GPU) for `OLD_DRIVER_DATACENTER_HOURS` always (delete an entry to forgive one, then restart) |
-| `$SECRETS/runpod_api_key`, `$SECRETS/runpod_pods/` | the key, and pod.sh's per-pod files |
+| `$SECRETS/api_key`, `$SECRETS/pods/` | the key, and pod.sh's per-pod files |
+| `~/.local/state/podd/pod-watchdog.log` | what pod.sh's per-pod lease watchdogs did |
 
 ## Tests
 
