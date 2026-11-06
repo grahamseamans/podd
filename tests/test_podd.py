@@ -243,6 +243,25 @@ def test_the_drain_time_opens_a_pod_only_when_the_backlog_outlasts_a_boot():
     assert podd.drain_seconds([(a_job(), 55)], [(huge, False)]) == float("inf")
 
 
+def test_the_2026_11_06_probe_opens_three_pods_for_its_five_jobs_not_five():
+    """monitoring's disc_head probe, replayed from the journal: beat_cuda solves of 356-443 s and 8.4-10.1 GB of card,
+    queued 1, then 3, then 5; a booting GPU pod's guess is 7.65 cores, 50 GB of RAM and the smallest card the set
+    accepts (20 GB). The per-job width said the 10.1 GB job fits one a pod, so the third pass opened three pods for it
+    (five in all; two ran nothing). Packed, the five fit three pods at once."""
+    guess = {"cpu": 7.65, "ram_gb": 50.0, "gpu_memory_gb": 20}
+    solves = [(a_job(gpu_memory_gb=memory, expected_s=seconds), seconds)
+              for memory, seconds in ((8.4, 356), (9.1, 392), (9.6, 417), (8.4, 356), (10.1, 443))]
+    assert podd.pods_to_open(solves[:1], [], guess, room=8, boot_seconds=150) == 1
+    assert podd.pods_to_open(solves[:3], [(guess, True)], guess, room=7, boot_seconds=150) == 1
+    assert not podd.fits_at_once(solves, [(guess, True)] * 2), "two 20 GB pods hold four of them"
+    assert podd.fits_at_once(solves, [(guess, True)] * 3)
+    assert podd.pods_to_open(solves, [(guess, True)] * 2, guess, room=6, boot_seconds=150) == 1, "was 3"
+    alone = [(a_job(cpu="all"), 400)] * 2
+    assert not podd.fits_at_once(alone, [(podd.capacity_of(FACTS_A), False)]), '"all" runs alone'
+    assert podd.fits_at_once(alone, [(podd.capacity_of(FACTS_A), False)] * 2)
+    assert podd.fits_at_once([(a_job(gpu_memory_gb=30), 55)], [(guess, True)]), "a booting pod counts for one"
+
+
 def test_create_is_offered_every_card_under_the_cap_in_stock_first_cheapest_first_and_none_over_it():
     """2026-10-14 10:01: gated on the stock listing, create was offered the 3090 alone, and RunPod had none."""
     offers = {"NVIDIA L40S": {"price_per_hour": 1.09, "stock": {"OC-AU-1": "Low"}},
@@ -635,6 +654,70 @@ def test_a_pod_that_did_not_boot_is_a_miss_its_set_waits_retries_after_the_backo
         assert "max_wait_for_a_pod_minutes" in reason and reason.count("no public ssh port after 15 min") == 2, reason
         assert "2 attempts" in reason, reason
     assert not pool.waiting_for_a_pod
+
+
+class PodThatBootsForever(PodThatDoesNotBoot):
+    """A pod whose create recorded its id and never ends by itself: its cancel and delete are recorded, never run."""
+    def start_booting(self):
+        self.boot_started_s = time.time()
+        self.pod_id_file.write_text(f"id-{self.name}")
+        self.stopped = self.deleted = None
+
+    def stop_booting(self):
+        self.stopped = True
+
+    def delete(self, reason):
+        self.state, self.deleted = "gone", reason
+
+
+def test_a_booting_pod_left_with_no_waiting_job_is_cancelled_and_one_past_the_boot_deadline_is_a_miss():
+    """2026-11-06: two pods still booting after the jobs they were opened for had all started on the pods that came up
+    first came up to nothing (5.9 and 13.7 min billed); one of them, a 3090 in EU-CZ-1, took 630 s to boot."""
+    root = Path(tempfile.mkdtemp(prefix="podd-cancel-"))
+    pool, queue_directory = no_pod_pool(root, jobs=1)
+    saved = podd.Pod, podd.STATUS_FILE
+    podd.Pod, podd.STATUS_FILE = PodThatBootsForever, root / "PODS.json"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            pool.step()
+            pod = pool.pods["podd-g1"]
+            pool.step()
+            assert pod.cancel_reason is None, "its job still waits: it boots on"
+            for stage in queue_directory.iterdir():                     # the job went elsewhere (or was taken back)
+                (stage / podjobs.JOB).unlink()
+            pool.step()
+            assert pod.cancel_reason.startswith("surplus") and "podd-g1" in pool.pods, said.getvalue()[-400:]
+            time.sleep(0.05)                                            # the cancel thread runs stop_booting
+            assert pod.stopped
+            pool.step()
+            assert not pool.pods and pod.deleted.startswith("its boot was cancelled: surplus"), said.getvalue()[-400:]
+            assert not pool.waiting_for_a_pod, "a surplus pod is no miss"
+
+        pool, queue_directory = no_pod_pool(Path(tempfile.mkdtemp(prefix="podd-deadline-")), jobs=1)
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            pool.step()
+            pod = pool.pods["podd-g1"]
+            pod.boot_started_s -= podd.BOOT_DEADLINE_FACTOR * 150 - 5
+            pool.step()
+            assert pod.cancel_reason is None, "inside the deadline"
+            pod.boot_started_s -= 10
+            pool.step()
+            assert pod.cancel_reason.startswith(podd.BOOT_DEADLINE_SAID), pod.cancel_reason
+            assert sorted(pool.pods) == ["podd-g1", "podd-g2"], "its job still waits: a fresh create replaces it"
+            pool.step()
+            assert sorted(pool.pods) == ["podd-g2"] and pod.deleted, said.getvalue()[-400:]
+            wait = next(iter(pool.waiting_for_a_pod.values()))
+            assert wait.misses == 1 and podd.BOOT_DEADLINE_SAID in wait.story[-1], wait.story
+            assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
+
+        pool, _ = no_pod_pool(Path(tempfile.mkdtemp(prefix="podd-unrecorded-")), jobs=0)
+        pod = podd.Pod("podd-g1", pool.secrets, a_job()["requires"], pool.config)   # booting, its id not yet recorded
+        pool.pods[pod.name] = pod
+        with contextlib.redirect_stdout(io.StringIO()):
+            pool.step()
+        assert pod.cancel_reason is None and "podd-g1" in pool.pods, "never cancelled before RunPod's id is saved"
+    finally:
+        podd.Pod, podd.STATUS_FILE = saved
 
 
 def test_a_job_no_pod_can_hold_still_fails_at_once_while_another_set_waits_after_a_boot_failure():

@@ -69,7 +69,9 @@ pod.sh, no ssh, no rsync.
 - `cpu_flavors`: the RunPod CPU flavors a CPU pod may be (`pod.sh avail-cpu`: $/vCPU-h and RAM per vCPU from the REST
   v2 catalog).
 - `boot_seconds` (default 150, the measured 97-155 s): podd opens another pod only while the backlog would take
-  longer than this to drain on the pods up or booting.
+  longer than this to drain on the pods up or booting. and they could not run it all at once (packed by cpu / card memory / RAM). A pod still booting
+  when no waiting job is left for it is stopped and deleted; one whose ssh is not up 3 x boot_seconds after its
+  create is a boot failure (deleted, a miss of its set).
 - `max_wait_for_a_pod_minutes` (default 60): a set with no pod it can run on -- RunPod refusing a create for stock ("no
   instances currently available"), no card under the price cap, a pod on an old driver, a pod that did not boot (`pod.sh create` failed, or podd could not read the pod), is waited out, never a failure
   on its own: the jobs stay JOB and podd retries one pod after 60 s, doubling to 10 min, avoiding

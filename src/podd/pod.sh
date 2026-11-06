@@ -173,7 +173,7 @@ watch_the_container() {
 # create_the_pod <name> <PodCreateInput JSON>: POST /pods, save the id, arm the watchdog, record price + RAM +
 # container disk + datacenter, wait for ssh, write the alias. GPU and CPU pods alike (create, create-cpu).
 create_the_pod() {
-  local body=$2 t0 created pod lease_s cost_per_hr machine datacenter memory_gb container_disk_gb
+  local body=$2 t0 created pod lease_s cost_per_hr machine datacenter card memory_gb container_disk_gb
   mkdir -p -m 700 $PODS_DIRECTORY && mkdir -p "${WATCHDOG_LOG_FILE%/*}"
   [ ! -s $POD_ID_FILE ] || { echo "pod.sh: a pod named $NAME is recorded already: $(pod_id) (pod.sh delete $NAME first)" >&2; exit 1; }
   t0=$(date +%s)
@@ -200,6 +200,10 @@ create_the_pod() {
   machine=$(rest GET "/pods/$pod?includeMachine=true")
   datacenter=$(field '(d.get("machine") or {}).get("dataCenterId") or ""' <<<"$machine")
   [ -n "$datacenter" ] || echo "pod.sh: (・_・;) GET /pods/$pod?includeMachine=true named no machine.dataCenterId: $machine" >&2
+  # what RunPod rented out of the cards offered (machine.gpuTypeId; a CPU pod: its cpuFlavorId), said and recorded:
+  # 2026-11-06, two pods that ran nothing left no card name in the journal
+  card=$(field '(d.get("machine") or {}).get("gpuTypeId") or (d.get("gpu") or {}).get("id") or d.get("cpuFlavorId") or ""' <<<"$machine")
+  [ -n "$card" ] || echo "pod.sh: (・_・;) GET /pods/$pod?includeMachine=true named no machine.gpuTypeId, gpu.id or cpuFlavorId: $machine" >&2
   # the pod's RAM (Pod.memoryInGb): the container has no cgroup memory limit (memory.max "max", MemTotal the host's
   # 540 GB, 2026-10-14), so this is the RAM podd packs against
   memory_gb=$(field 'd.get("memoryInGb") or ""' <<<"$created")
@@ -207,8 +211,8 @@ create_the_pod() {
   # the pod's container disk as RunPod made it (Pod.containerDiskInGb): podd matches requires.disk_gb_min against it
   container_disk_gb=$(field 'd.get("containerDiskInGb") or ""' <<<"$created")
   [ -n "$container_disk_gb" ] || echo "pod.sh: (・_・;) the create response carries no containerDiskInGb: $created" >&2
-  COST=$cost_per_hr T0=$t0 DC=$datacenter MEMORY=$memory_gb DISK=$container_disk_gb python3 -c 'import json, os; print(json.dumps({"cost_per_hr": float(os.environ["COST"]) if os.environ["COST"] else None, "created_at_unix_s": int(os.environ["T0"]), "datacenter": os.environ["DC"] or None, "memory_gb": float(os.environ["MEMORY"]) if os.environ["MEMORY"] else None, "container_disk_gb": float(os.environ["DISK"]) if os.environ["DISK"] else None}))' > $POD_SESSION_FILE
-  echo "pod $NAME ($pod) created in ${datacenter:-an unnamed datacenter} at \$$cost_per_hr/h; waiting for its ssh port"
+  COST=$cost_per_hr T0=$t0 DC=$datacenter CARD=$card MEMORY=$memory_gb DISK=$container_disk_gb python3 -c 'import json, os; print(json.dumps({"cost_per_hr": float(os.environ["COST"]) if os.environ["COST"] else None, "created_at_unix_s": int(os.environ["T0"]), "datacenter": os.environ["DC"] or None, "card": os.environ["CARD"] or None, "memory_gb": float(os.environ["MEMORY"]) if os.environ["MEMORY"] else None, "container_disk_gb": float(os.environ["DISK"]) if os.environ["DISK"] else None}))' > $POD_SESSION_FILE
+  echo "pod $NAME ($pod) created: ${card:-an unnamed card} in ${datacenter:-an unnamed datacenter} at \$$cost_per_hr/h; waiting for its ssh port"
   # Every wait for the pod also watches its container (watch_the_container): one that does not stay up fails the
   # create in seconds, not after the 15 min below. Both waits: a failing container's ssh port flickers up (observed
   # 2026-10-30), so the port alone can pass the first wait into an ssh that never answers.
@@ -407,10 +411,11 @@ import json, sys, time
 session = json.load(open(sys.argv[1]))
 minutes = (time.time() - session["created_at_unix_s"]) / 60
 rate = session["cost_per_hr"]
+card = session.get("card") or "card not recorded"
 if rate is None:
-    print("pod %s deleted after %.1f min; (・_・;) its create response carried no costPerHr, so no cost" % (sys.argv[2], minutes))
+    print("pod %s (%s) deleted after %.1f min; (・_・;) its create response carried no costPerHr, so no cost" % (sys.argv[2], card, minutes))
 else:
-    print("pod %s deleted after %.1f min at $%.2f/h: $%.4f this session" % (sys.argv[2], minutes, rate, rate * minutes / 60))' $POD_SESSION_FILE "$NAME ($pod)"
+    print("pod %s (%s) deleted after %.1f min at $%.2f/h: $%.4f this session" % (sys.argv[2], card, minutes, rate, rate * minutes / 60))' $POD_SESSION_FILE "$NAME ($pod)"
   else
     echo "pod $NAME ($pod) deleted (pod.sh (・_・;) no $POD_SESSION_FILE: its create never recorded the price, so no cost)"
   fi

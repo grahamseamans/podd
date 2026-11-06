@@ -33,7 +33,9 @@ WHEN TO OPEN A POD: per requirement set with jobs waiting (oldest set first), th
 pods up or booting that serve it: for each of the set's running (remaining seconds) and waiting jobs, its expected
 seconds over how many such jobs those pods run at once, summed. podd opens pods one at a time while the drain exceeds
 boot_seconds (a pod opened later would come up after the work is done) and there are fewer pods of its kind (GPU or
-CPU, booting or not) than max_pods of that kind. A job's
+CPU, booting or not) than max_pods of that kind, and only while those pods could not run the whole backlog at once
+(fits_at_once, a packing). A booting pod with no waiting job left for it, or past its boot deadline, is stopped and
+deleted (Pool.cancel_boots). A job's
 expected seconds: its `expected_s` (required). A job on a slow or broken pod stays there and is no backlog. A booting
 pod's capacity is the last one podd measured (else
 FIRST_GUESS_CAPACITY; its card memory the smallest card the set accepts), and it counts for at least one job of a set
@@ -178,6 +180,10 @@ MAX_SLOW_STOPS = 2                   # a job is moved off a slow pod at most thi
 SHUTDOWN_PULL_SECONDS = 840          # podd stopping: its running jobs are stopped and pulled home for this long at most
                                      # (podd.service TimeoutStopSec 900)
 PROGRESS_MARK = "--podd-progress--"  # separates the exit file from the progress file in one poll's output
+BOOT_DEADLINE_FACTOR = 3             # a booting pod whose ssh is not up this x boot_seconds after its create began is
+                                     # stopped and deleted, a boot failure (Pool.cancel_boots; 2026-11-06: one 3090
+                                     # took 630 s, the day's others 36-176 s)
+BOOT_DEADLINE_SAID = "did not boot within the boot deadline"
 OFFERS_SECONDS = 60                  # pod.sh avail (prices, stock) at most this often; the price-cap wait is said
                                      # this often
 # A booting pod's capacity before its facts are read, until podd has measured one: an A40 of RunPod's secure cloud
@@ -467,22 +473,41 @@ def drain_seconds(backlog, pods):
     return total
 
 
-def all_at_once(backlog, pods):
-    """Could the pods up or booting run every job of the backlog at the same time? (every job's width, how many such
-    jobs they run at once, is at least the backlog's length): another pod would only idle."""
-    return all(sum(max(how_many_fit(job, capacity), 1 if booting else 0) for capacity, booting in pods)
-               >= len(backlog) for job, _ in backlog)
+def fits_at_once(backlog, pods):
+    """Could the pods up or booting run EVERY job of the backlog at the same time? (pure) A packing, never a
+    per-job width: the jobs, largest card memory first, then most cpu, each go to the first pod whose capacity left
+    covers them, and a booting pod with nothing packed on it takes any one job (it counts for one at least, as in
+    drain_seconds). Then another pod would only idle. (2026-11-06: five ~400 s solves on two booting pods of a 20 GB
+    guess; the per-job width said a 10.1 GB job fits one a pod, so podd opened three more pods for its one job: five
+    pods for five jobs, two of them never ran one, $0.14 of $0.333.)"""
+    left = [dict(capacity) for capacity, _ in pods]
+    empty_booting = [booting for _, booting in pods]
+    for job, _ in sorted(backlog, key=lambda item: (-item[0]["gpu_memory_gb"],
+                                                    -(math.inf if item[0]["cpu"] == "all" else item[0]["cpu"]))):
+        for index, (capacity, booting) in enumerate(pods):
+            demand = demand_of(job, capacity)
+            if job["cpu"] == "all" and left[index] != capacity:
+                continue                                 # "all" runs alone: only on a pod nothing is packed on
+            if covers(left[index], demand) or empty_booting[index]:
+                left[index] = less(left[index], demand) if covers(left[index], demand) else \
+                    {resource: -1.0 for resource in RESOURCES}       # the booting pod's one job fills it
+                empty_booting[index] = False
+                break
+        else:
+            return False
+    return True
 
 
 def pods_to_open(backlog, pods, new_pod_capacity, room, boot_seconds):
     """THE OPENING RULE (pure): how many pods to open for one requirement set: one at a time, while its drain time
     on the pods up or booting (plus the ones opened here, each of new_pod_capacity, booting) exceeds boot_seconds and
-    they could not yet run the whole backlog at once (2026-10-15: one 400 s job opened three pods, the drain time
-    spreading one job's seconds over pods it cannot use), at most room."""
+    they could not yet run the whole backlog at once (fits_at_once; 2026-10-15: one 400 s job opened three pods, the
+    drain time spreading one job's seconds over pods it cannot use; 2026-11-06: five jobs opened five pods), at most
+    room."""
     opened = 0
     while opened < room:
         serving = pods + [(new_pod_capacity, True)] * opened
-        if drain_seconds(backlog, serving) <= boot_seconds or (serving and all_at_once(backlog, serving)):
+        if drain_seconds(backlog, serving) <= boot_seconds or (serving and fits_at_once(backlog, serving)):
             break
         opened += 1
     return opened
@@ -750,6 +775,9 @@ class Pod:
         self.problem = None               # why it is broken, mismatched, or why its boot failed
         self.idle_since = None
         self.create_process = None
+        self.boot_started_s = None        # when its boot began (the boot deadline, Pool.cancel_boots)
+        self.cancel_reason = None         # set by Pool.cancel_boots: the boot is stopped and the pod deleted
+        self.boot_thread = None
 
     def ssh(self, command, check=True, timeout_s=SSH_COMMAND_TIMEOUT_S, input_text=None):
         """One command on the pod through pod.sh's alias (its ControlMaster connection)."""
@@ -768,7 +796,26 @@ class Pod:
             return None
 
     def start_booting(self):
-        threading.Thread(target=self.boot, daemon=True, name=f"boot {self.name}").start()
+        self.boot_started_s = time.time()
+        self.boot_thread = threading.Thread(target=self.boot_unless_cancelled, daemon=True, name=f"boot {self.name}")
+        self.boot_thread.start()
+
+    def boot_ended(self):
+        return self.boot_thread is None or not self.boot_thread.is_alive()
+
+    def boot_unless_cancelled(self):
+        """The boot thread: boot, then "cancelled" when Pool.cancel_boots stopped it on the way (whatever the boot
+        ended as: its pod.sh create was terminated, or it came up after the cancel)."""
+        self.boot()
+        if self.cancel_reason is not None:
+            self.state = "cancelled"
+
+    def cancel(self, reason):
+        """Stop this booting pod (Pool.cancel_boots): its pod.sh create is terminated in a thread of its own (never
+        holding up the pass), and once the boot thread ends the pod is "cancelled" and Pool.step deletes it."""
+        self.cancel_reason = reason
+        say(f"{self.name}: cancelling its boot: {reason}")
+        threading.Thread(target=self.stop_booting, daemon=True, name=f"cancel {self.name}").start()
 
     def create_command(self):
         image = job_contract.acceptable(self.requires["image"])[0]
@@ -857,11 +904,21 @@ class Pod:
         if recorded is None:
             say(f"{self.name}: no pod recorded to delete ({reason})")
             return
-        say(f"{self.name}: deleting pod {recorded}: {reason}")
+        say(f"{self.name}: deleting pod {recorded} ({self.card_name()}): {reason}")
         deleted = subprocess.run([str(POD_SCRIPT), "delete", self.name], stdin=subprocess.DEVNULL)
         if deleted.returncode != 0:
             raise PodError(f"(╯°□°)╯ pod.sh delete {self.name} ({recorded}) exited {deleted.returncode}: THE POD MAY "
                            f"STILL BE BILLING; {POD_SCRIPT} account / delete {self.name} by hand")
+
+    def card_name(self):
+        """What RunPod rented: the card nvidia-smi named (its facts), else the card or CPU flavor pod.sh create
+        recorded in the session file (RunPod's machine.gpuTypeId / cpuFlavorId), else said unknown."""
+        if self.facts and self.facts.get("gpu"):
+            return self.facts["gpu"]
+        try:
+            return json.loads(self.session_file.read_text()).get("card") or "card not recorded"
+        except (FileNotFoundError, json.JSONDecodeError):
+            return "card not recorded"
 
     def renew_lease(self):
         """Touch pod.sh's watchdog lease: the pod has work. A missing lease is said loudly, and made."""
@@ -1439,9 +1496,30 @@ class Pool:
                 or any(pod.state in ("ready", "slow") and pod.facts and not unmet_requirements(requires, pod.facts)
                        for pod in self.pods.values()))
 
+    def cancel_boots(self, unplaced):
+        """A BOOTING POD IS STOPPED (Pod.cancel; deleted by step once its boot thread ends) when it would run nothing:
+        no waiting job of a set it serves (booting_pod_serves) is left unplaced, the ready pods took them all
+        (2026-11-06: two pods still booting when the five jobs they were opened for had started elsewhere came up to
+        nothing, 5.9 and 13.7 min billed, $0.14 of $0.333) -- or when its ssh is not up BOOT_DEADLINE_FACTOR x
+        boot_seconds after its create began (that day's 3090 in EU-CZ-1 took 630 s against 109-176 s for the
+        others): a boot failure, a miss of its set (NoPodWait), so a needed pod is created again after the backoff. A
+        pod whose create has not recorded its id yet is left to the next pass, so a pod RunPod made is never lost
+        unrecorded."""
+        deadline_s = BOOT_DEADLINE_FACTOR * self.config["boot_seconds"]
+        for pod in list(self.pods.values()):
+            if pod.state != "booting" or pod.cancel_reason is not None or pod.recorded_pod_id() is None:
+                continue
+            booted_s = time.time() - (pod.boot_started_s or time.time())
+            if not any(booting_pod_serves(pod.requires, job["requires"], self.config["cards"])
+                       for _, job in unplaced):
+                pod.cancel(f"surplus: no waiting job is left for it ({booted_s:.0f} s into its boot)")
+            elif booted_s > deadline_s:
+                pod.cancel(f"{BOOT_DEADLINE_SAID} ({deadline_s:.0f} s: {BOOT_DEADLINE_FACTOR} x boot_seconds "
+                           f"{self.config['boot_seconds']}), {booted_s:.0f} s into its boot")
+
     def open_pods(self, unplaced, ready, waiting_keys):
         """THE OPENING RULE per requirement set with jobs waiting, oldest set first (pods_to_open)."""
-        booting = [pod for pod in self.pods.values() if pod.state == "booting"]
+        booting = [pod for pod in self.pods.values() if pod.state == "booting" and pod.cancel_reason is None]
         for key in waiting_keys:
             wait = self.waiting_for_a_pod.get(key)
             if wait and (time.time() < wait.retry_at_s
@@ -1514,6 +1592,13 @@ class Pool:
         waiting = self.waiting_jobs()
         for pod in list(self.pods.values()):
             key = requirement_key(pod.requires)
+            if pod.cancel_reason is not None:            # Pool.cancel_boots stopped it: deleted once its boot ended
+                if pod.boot_ended():                     # (whatever it ended as, even ready: it runs nothing)
+                    self.pods.pop(pod.name)
+                    self.forget(pod, f"its boot was cancelled: {pod.cancel_reason}")
+                    if pod.cancel_reason.startswith(BOOT_DEADLINE_SAID):
+                        self.no_pod_miss(key, pod.attempt, f"{pod.name} {pod.cancel_reason}")
+                continue
             if (pod.state == "ready" and key in self.waiting_for_a_pod     # a pod the set can use (not one on an old
                     and pod.attempt > self.waiting_for_a_pod[key].counted_attempt):   # driver), made AFTER the miss
                 wait = self.waiting_for_a_pod.pop(key)    # (2026-10-15: a pod made before it cleared the wait every pass)
@@ -1549,11 +1634,12 @@ class Pool:
                                             f"({reason})")
         self.fail_the_jobs_that_waited_too_long_for_a_pod(waiting)
 
-        ready = {name: pod for name, pod in self.pods.items() if pod.state == "ready"}
+        ready = {name: pod for name, pod in self.pods.items() if pod.state == "ready" and pod.cancel_reason is None}
         self.fail_the_jobs_no_pod_can_hold(waiting, ready)
         for stage, pod_name in place(waiting, {name: (pod.facts, self.free(pod)) for name, pod in ready.items()}):
             self.claim(stage, dict(waiting)[stage], ready[pod_name])
         unplaced = [(stage, job) for stage, job in waiting if str(stage) not in self.running]
+        self.cancel_boots(unplaced)
         self.open_pods(unplaced, ready, list(dict.fromkeys(requirement_key(job["requires"]) for _, job in unplaced)))
 
         for pod in list(self.pods.values()):

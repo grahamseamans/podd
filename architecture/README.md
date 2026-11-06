@@ -120,6 +120,11 @@ THE PATTERN.
   miss, above).
 - A failed pod delete is said loudly and retried every minute, never podd's end (2026-10-15: one RunPod HTTP 500 on
   a DELETE stopped podd, failing two running jobs on other pods and leaving two pods billing).
+- A pod opens only while the set's backlog would outlast a boot on the pods up or booting AND they could not run it
+  all at once (fits_at_once: a packing, never a per-job width; 2026-11-06: five jobs opened five pods, two ran
+  nothing). A booting pod is stopped and deleted when no waiting job is left for it, or when its ssh is not up
+  BOOT_DEADLINE_FACTOR x boot_seconds after its create (a boot failure: a miss of its set) (Pool.cancel_boots).
+  pod.sh records and says the card RunPod rented (machine.gpuTypeId) on create and on delete.
 - Pods never outlive their work: idle -> deleted, podd stopped -> deleted (a booting create is stopped first), podd
   killed -> pod.sh's watchdog (its lease stops being renewed), podd started -> every pod pod.sh still records deleted.
 
