@@ -101,7 +101,7 @@ stopped part-way, + a record in `attempts`).
 - `requires.image` is what podd launches; `gpu` (`"any"`, a list of card names, or `"none"`: a CPU pod),
   `gpu_memory_gb_min`, `cpu_min` are measured on the pod; `disk_gb_min` (decimal GB of container disk, optional) is
   what podd creates the pod with when it is more than the default (30 GB on a GPU pod, 20 on a CPU pod; a CPU pod
-  gets 1 vCPU for every 10 GB, so a large disk makes it larger), matched against RunPod's `containerDiskInGb` for the
+  gets 1 vCPU for every 10 GB, so a large disk makes it larger), matched against RunPod's `disk` for the
   pod; every other key is matched against the facts the image declares in `/etc/podd-facts.json` (below).
 - `cpu` (cores, or `"all"`: the pod's whole quota, alone), `gpu_memory_gb`, `ram_gb`: what it uses, packed against
   what podd measured the pod has.

@@ -19,9 +19,9 @@ a pod without it is refused), the image tag podd launched it from, nvidia-smi's 
 pod without nvidia-smi has gpu null, gpu_memory_gb 0 and cuda_version null: a CPU pod) and the driver's CUDA version
 (cuda_version, nvidia-smi's "CUDA Version: X.Y"),
 the cgroup CPU quota (else its cpuset's CPU count), the RAM (cgroup memory.max, else MemTotal, at most RunPod's
-memoryInGb for the pod: a RunPod
+gpu.memory / cpu.memory for the pod: a RunPod
 container has no memory limit and sees the host's), and pod.sh's price, datacenter and container disk (RunPod's
-containerDiskInGb for the pod: disk_gb). A job
+`disk` for the pod: disk_gb). A job
 runs on a pod whose facts satisfy its `requires`. The pod's CAPACITY is its cpu, gpu_memory_gb and ram_gb facts.
 
 THE POOL: RESOURCE PACKING. A job declares the
@@ -536,7 +536,7 @@ def pod_kind(requires):
 
 
 def container_disk_gb(requires):
-    """The container disk (whole GB: RunPod's containerDiskInGb is an integer) a pod opened for this set is created
+    """The container disk (whole GB: RunPod's `disk` is an integer) a pod opened for this set is created
     with: its kind's default, or the set's disk_gb_min when larger."""
     default = CPU_CONTAINER_DISK_GB if is_cpu_set(requires) else GPU_CONTAINER_DISK_GB
     return max(default, math.ceil(requires.get("disk_gb_min", 0)))
@@ -637,7 +637,7 @@ def facts_of_pod(image_facts_text, gpu_text, cpu_text, ram_text, image, session,
     unlimited = ram_lines[0].strip() in ("max", "none")
     ram_bytes = int(ram_lines[-1].split()[1]) * 1024 if unlimited else int(ram_lines[0])
     ram_gb = round(ram_bytes / 1e9, 2)
-    if session.get("memory_gb"):                  # RunPod's Pod.memoryInGb: a RunPod container has no memory limit
+    if session.get("memory_gb"):                  # RunPod's Pod gpu.memory / cpu.memory: a RunPod container has no memory limit
         ram_gb = min(ram_gb, session["memory_gb"])  # and sees the host's RAM (540 GB on an A40 host, 2026-10-14)
     return {**image_facts, "pod_name": name, "pod_id": pod_id, "image": image, "gpu": gpu_name,
             "gpu_memory_gb": round(int(gpu_memory_mib) * 1048576 / 1e9, 2), "cuda_version": cuda_version,
@@ -912,7 +912,7 @@ class Pod:
 
     def card_name(self):
         """What RunPod rented: the card nvidia-smi named (its facts), else the card or CPU flavor pod.sh create
-        recorded in the session file (RunPod's machine.gpuTypeId / cpuFlavorId), else said unknown."""
+        recorded in the session file (RunPod's Pod gpu.id / cpu.id), else said unknown."""
         if self.facts and self.facts.get("gpu"):
             return self.facts["gpu"]
         try:

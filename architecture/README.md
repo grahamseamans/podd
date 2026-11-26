@@ -51,7 +51,7 @@ THE PATTERN.
   A client imports `podd.job_contract` and nothing else of podd.
 - Requirements are matched, never assumed: `requires.image` is launched, `gpu` / `gpu_memory_gb_min` / `cpu_min` are
   measured on the pod, `disk_gb_min` is created (the container disk podd asks for) and matched against RunPod's
-  `containerDiskInGb` for the pod, every other key is matched against the facts the IMAGE declares (/etc/podd-facts.json). A pod
+  `disk` for the pod, every other key is matched against the facts the IMAGE declares (/etc/podd-facts.json). A pod
   without declared facts is refused; a pod opened for a set that turns out not to satisfy it is deleted and the set's
   jobs FAIL (no create loop). DONE says what was used; the client records it.
 - A client never talks to RunPod: no `pod.sh`, no ssh, no rsync. What it learns of a pod is DONE's `used`.
@@ -124,7 +124,7 @@ THE PATTERN.
   all at once (fits_at_once: a packing, never a per-job width; 2026-11-06: five jobs opened five pods, two ran
   nothing). A booting pod is stopped and deleted when no waiting job is left for it, or when its ssh is not up
   BOOT_DEADLINE_FACTOR x boot_seconds after its create (a boot failure: a miss of its set) (Pool.cancel_boots).
-  pod.sh records and says the card RunPod rented (machine.gpuTypeId) on create and on delete.
+  pod.sh records and says the card RunPod rented (REST v2 Pod gpu.id / cpu.id) on create and on delete.
 - Pods never outlive their work: idle -> deleted, podd stopped -> deleted (a booting create is stopped first), podd
   killed -> pod.sh's watchdog (its lease stops being renewed), podd started -> every pod pod.sh still records deleted.
 

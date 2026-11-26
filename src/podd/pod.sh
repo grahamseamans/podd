@@ -3,8 +3,10 @@
 # owner (podd) died. Several pods at once, each by NAME (podd names them podd-g1 .. podd-g<n> and podd-c1 .. podd-c<n>): its own id file,
 # price, lease and ssh alias (runpod-<name>, one ControlMaster connection each). Nothing about jobs or projects: podd
 # (src/podd/daemon.py, the pod job runner) decides which image, which cards, how many CPUs, and runs the
-# jobs (architecture/README.md). A pod runs the image it is created with (no template: POST /pods takes imageName,
-# references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json PodCreateInput). No volume: the pod's own disk holds a
+# jobs (architecture/README.md). RunPod's REST v2 (https://api.runpod.io/v2; references/runpod/docs/api-reference-v2/
+# openapi.json and migrate-from-v1.mdx: REST v1, rest.runpod.io, was retired 2026-11-15 and its host is gone). A pod
+# runs the image it is created with (no template: POST /v2/pods takes image, CreatePodRequest). No volume (no mounts):
+# the pod's own disk holds a
 # job while it runs and podd pulls results home, so a pod can be in ANY datacenter on the first free card (user,
 # 2026-10-05: "we made the image, we don't care what datacenter"). Reads the API key from $SECRETS
 # (secrets.sh, the one place) and keeps each pod's files in $SECRETS/pods/.
@@ -12,16 +14,16 @@
 #   pod.sh avail <cards>         # JSON: each card's $/h and the datacenters stocking it now
 #   pod.sh create <name> <image> <cards> <min vCPU> <disk GB> [<avoid datacenters>]
 #                                             # a pod of <image> on the first free card of <cards> (comma-separated,
-#                                             # in the order RunPod tries them), >= <min vCPU> per GPU, on any host
+#                                             # asked one at a time in that order), >= <min vCPU> per GPU, on any host
 #                                             # (podd measures the driver's CUDA version on the pod), a container disk
 #                                             # of <disk GB> (whole GB; podd's container_disk_gb), any datacenter
 #                                             # but <avoid datacenters> (comma-separated: podd's avoided ones);
 #                                             # save its id, arm its watchdog (deleted $MAX_POD_HOURS (default 2) after
 #                                             # its lease was last renewed: podd renews it while the pod has work), wait
 #                                             # for ssh (exit 1 once its container fails to start twice:
-#                                             # watch_the_container), write its ssh alias. Exit 75 (EX_TEMPFAIL):
-#                                             # RunPod has no instance of any card offered now (a stock race, not an
-#                                             # error: retry)
+#                                             # watch_the_container, or RunPod says the pod is in ERROR), write its
+#                                             # ssh alias. Exit 75 (EX_TEMPFAIL): RunPod placed no card offered now (a
+#                                             # stock race, not an error: retry); exit 1: a refusal of the request
 #   pod.sh avail-cpu <flavors>   # JSON: each CPU flavor's $/vCPU-h, RAM per vCPU, vCPU range, stock
 #   pod.sh create-cpu <name> <image> <flavors> <vCPU> <disk GB> [<avoid datacenters>]
 #                                             # a CPU pod (no card) of <image>: the first free flavor of <flavors>
@@ -39,38 +41,50 @@ set -euo pipefail
 source "$(dirname "$0")/secrets.sh"
 PODS_DIRECTORY=$SECRETS/pods
 WATCHDOG_LOG_FILE=$HOME/.local/state/podd/pod-watchdog.log   # a log, not a secret: beside PODS.json
-API=https://rest.runpod.io/v1
+API=https://api.runpod.io/v2
 [ -s $SECRETS/api_key ] || { echo "pod.sh: no API key in $SECRETS/api_key" >&2; exit 1; }
 # The key reaches curl only through a header file (curl -H @file); printf is a builtin, so it is never in any argv.
 auth() { printf 'Authorization: Bearer %s\n' "$(<$SECRETS/api_key)"; }
 
-rest() {  # rest <method> <path> [json-body]; fails loudly on any non-2xx, printing RunPod's body
-  local out code
-  out=$(curl -sS -w '\n%{http_code}' -X "$1" -H @<(auth) -H 'Content-Type: application/json' \
-        ${3:+--data "$3"} "$API$2")
-  code=${out##*$'\n'}; out=${out%$'\n'*}
-  if [[ $code != 2* ]]; then
-    echo "RunPod $1 $2 -> HTTP $code: $out" >&2
-    # RunPod has no machine for the request right now (HTTP 500 "create pod: There are no instances currently
-    # available", 2026-10-14; for a CPU pod "There are no longer any instances available with the requested
-    # specifications", 2026-10-15, every 16-vCPU flavor while 8 vCPU created): a stock race, exit 75 (EX_TEMPFAIL) so
-    # the caller retries instead of failing
-    if [[ $1 == POST && $2 == /pods && ( ${out,,} == *"no instances"* || ${out,,} == *"no longer any instances"* ) ]]; then
-      exit 75
-    fi
+# ask <method> <path> [json-body]: one REST v2 call; sets ANSWER_CODE (HTTP status) and ANSWER (RunPod's body). A call
+# that reaches no server (2026-11-26: rest.runpod.io NXDOMAIN broke every create) is a loud exit 1.
+ask() {
+  local out
+  if ! out=$(curl -sS -w '\n%{http_code}' -X "$1" -H @<(auth) -H 'Content-Type: application/json' \
+        ${3:+--data "$3"} "$API$2"); then
+    echo "pod.sh: (╯°□°)╯ RunPod $1 $API$2: curl got no answer (curl's error above)" >&2
     exit 1
   fi
-  printf '%s' "$out"
+  ANSWER_CODE=${out##*$'\n'}; ANSWER=${out%$'\n'*}
 }
 
-# Every datacenter RunPod's create takes (PodCreateInput.dataCenterIds' enum,
-# references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json). Without an avoid list create sends no dataCenterIds
+rest() {  # rest <method> <path> [json-body]; fails loudly on any non-2xx, printing RunPod's body
+  ask "$@"
+  if [[ $ANSWER_CODE != 2* ]]; then
+    echo "RunPod $1 $2 -> HTTP $ANSWER_CODE: $ANSWER" >&2
+    exit 1
+  fi
+  printf '%s' "$ANSWER"
+}
+
+# RunPod placing no machine for a create, by its words. REST v2 answers capacity with HTTP 400 and only a human
+# `detail` (POST /v2/pods' description: "this GPU and data center combination could not be placed"; no
+# machine-readable code). REST v1 said HTTP 500 "There are no instances currently available" (2026-10-14) and, for a
+# CPU size, "There are no longer any instances available with the requested specifications" (2026-10-15). v2's exact
+# wording is not documented: a capacity refusal these miss is still a refusal (exit 1, podd's "did not boot", also a
+# miss of the set's wait), only named less well. Lowercase fragments.
+NO_STOCK_WORDS=("no instances" "no longer any instances" "could not be placed" "capacity" "not available"
+                "unavailable")
+said_no_stock() { local word; for word in "${NO_STOCK_WORDS[@]}"; do [[ ${1,,} == *"$word"* ]] && return 0; done; return 1; }
+
+# Every datacenter RunPod's create took (REST v1 PodCreateInput.dataCenterIds' enum,
+# references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json; v2's CreatePodRequest.dataCenterIds is a free list of
+# strings, GET /v2/catalog/datacenters lists them). Without an avoid list create sends no dataCenterIds
 # (any datacenter, new ones too); with one it sends this list less the avoided (a datacenter added after 2026-10-10 is
 # then not asked for: re-mirror the API and update this list).
 RUNPOD_DATACENTERS=EU-RO-1,CA-MTL-1,EU-SE-1,US-IL-1,EUR-IS-1,EU-CZ-1,US-TX-3,EUR-IS-2,US-KS-2,US-GA-2,US-WA-1,US-TX-1,CA-MTL-3,EU-NL-1,US-TX-4,US-CA-2,US-NC-1,OC-AU-1,US-DE-1,EUR-IS-3,CA-MTL-2,AP-JP-1,EUR-NO-1,EU-FR-1,US-KS-3,US-GA-1,AP-IN-1,US-MD-1,US-MO-1,US-MO-2
 
-# whole_gb <disk GB>: the container disk asked for, a positive whole number (RunPod's containerDiskInGb is an
-# integer), or a loud exit: never a default chosen here (podd's container_disk_gb is the one place)
+# whole_gb <disk GB>: the container disk asked for, a positive whole number (RunPod's `disk` is an integer), or a loud exit: never a default chosen here (podd's container_disk_gb is the one place)
 whole_gb() {
   [[ $1 =~ ^[1-9][0-9]*$ ]] || { echo "pod.sh: (╯°□°)╯ the container disk must be a positive whole number of GB, got '$1'" >&2; exit 1; }
   printf '%s' "$1"
@@ -97,8 +111,8 @@ print(json.dumps(allowed))'
 field() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {}, {'d': d}))" "$1"; }
 
 # THE CONTAINER WHILE A POD BOOTS. RunPod's GraphQL Pod.runtime (references/runpod/docs/sdks/graphql/manage-pods.mdx:
-# runtime { uptimeInSeconds ports }) is null until the pod's container first starts; the REST Pod has no such field,
-# and its lastStatusChange / desiredStatus say nothing of a failed start ("Rented by User: <time>" / RUNNING
+# runtime { uptimeInSeconds ports }) is null until the pod's container first starts; the REST v1 Pod had no such
+# field, and its lastStatusChange / desiredStatus said nothing of a failed start ("Rented by User: <time>" / RUNNING
 # throughout, observed). What RunPod answered, 2026-10-30, polled every ~5-30 s on throwaway L4 pods (US-MO-2,
 # EUR-IS-*):
 #   - a container that starts: runtime null while the image pulls (nvidia/cuda base: 13 s; podd's ai_research image:
@@ -170,14 +184,44 @@ watch_the_container() {
   last_container_uptime=$uptime
 }
 
-# create_the_pod <name> <PodCreateInput JSON>: POST /pods, save the id, arm the watchdog, record price + RAM +
-# container disk + datacenter, wait for ssh, write the alias. GPU and CPU pods alike (create, create-cpu).
+# create_the_pod <name> <gpu|cpu> <candidates, comma-separated> <CreatePodRequest JSON, its gpu / cpu without id>:
+# POST /v2/pods once per candidate (card or CPU flavor) in order until one is placed -- v2 takes ONE gpu type or CPU
+# flavor per create, no fallback list (migrate-from-v1.mdx, "Removed": "retry with the next type in your own code")
+# -- then save the id, arm the watchdog, record price + RAM + container disk + datacenter, wait for ssh, write the
+# alias. GPU and CPU pods alike (create, create-cpu). Per candidate (POST /v2/pods' "Which failures are worth
+# retrying"): 422 (a body v2 does not take) and 402 (no balance) end the create at once, exit 1; any other refusal
+# tries the next. Every candidate refused for stock (said_no_stock, 429, 5xx): exit 75; else exit 1.
 create_the_pod() {
-  local body=$2 t0 created pod lease_s cost_per_hr machine datacenter card memory_gb container_disk_gb
+  local kind=$2 candidate body refusals="" refused_for_more_than_stock="" t0 created="" pod lease_s cost_per_hr
+  local datacenter card memory_gb container_disk_gb candidates
   mkdir -p -m 700 $PODS_DIRECTORY && mkdir -p "${WATCHDOG_LOG_FILE%/*}"
   [ ! -s $POD_ID_FILE ] || { echo "pod.sh: a pod named $NAME is recorded already: $(pod_id) (pod.sh delete $NAME first)" >&2; exit 1; }
   t0=$(date +%s)
-  created=$(rest POST /pods "$body")
+  IFS=, read -r -a candidates <<<"$3"
+  for candidate in "${candidates[@]}"; do
+    body=$(BODY=$4 KIND=$kind ID=$candidate python3 -c 'import json, os; body = json.loads(os.environ["BODY"]); body[os.environ["KIND"]]["id"] = os.environ["ID"]; print(json.dumps(body))')
+    ask POST /pods "$body"
+    if [[ $ANSWER_CODE == 201 ]]; then created=$ANSWER; break; fi
+    echo "RunPod POST /pods ($kind $candidate) -> HTTP $ANSWER_CODE: $ANSWER" >&2
+    if [[ $ANSWER_CODE == 422 || $ANSWER_CODE == 402 || $ANSWER_CODE == 2* ]]; then
+      echo "pod.sh: (╯°□°)╯ RunPod refused the create itself (422: a body v2 does not take; 402: no balance; 202: a" \
+           "queued pod, which pod.sh never asks for): no other candidate can succeed" >&2
+      exit 1
+    fi
+    refusals+="${refusals:+ / }$candidate: HTTP $ANSWER_CODE"
+    if ! said_no_stock "$ANSWER" && [[ $ANSWER_CODE != 429 && $ANSWER_CODE != 5* ]]; then
+      refused_for_more_than_stock=yes
+    fi
+  done
+  if [ -z "$created" ]; then
+    if [ -z "$refused_for_more_than_stock" ]; then
+      echo "pod $NAME: RunPod placed none of $3 now, no instances ($refusals)" >&2
+      exit 75
+    fi
+    echo "pod $NAME: RunPod refused every one of $3 ($refusals), not all for stock (every candidate the same 400:" \
+         "the request itself, POST /v2/pods' description)" >&2
+    exit 1
+  fi
   pod=$(field 'd["id"]' <<<"$created")
   echo "$pod" > $POD_ID_FILE
   # Watchdog, armed the moment the id is saved (before anything here can fail): whatever the caller does, this pod
@@ -192,36 +236,32 @@ create_the_pod() {
         '$0' delete '$NAME'; exit; fi; sleep 60; done" \
     >> "$WATCHDOG_LOG_FILE" 2>&1 &
   echo "pod $NAME ($pod): watchdog armed, deleted ${MAX_POD_HOURS:-2} h (MAX_POD_HOURS) after its lease was last renewed"
-  # the price is on the create response (Pod.costPerHr); the datacenter is on the pod's machine, which GET /pods/{id}
-  # returns only with includeMachine=true (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json)
-  # Neither read may stop the create here: a missing field is said loudly and recorded as null.
-  cost_per_hr=$(field 'd.get("costPerHr") or ""' <<<"$created")
-  [ -n "$cost_per_hr" ] || echo "pod.sh: (・_・;) the create response carries no costPerHr: $created" >&2
-  machine=$(rest GET "/pods/$pod?includeMachine=true")
-  datacenter=$(field '(d.get("machine") or {}).get("dataCenterId") or ""' <<<"$machine")
-  [ -n "$datacenter" ] || echo "pod.sh: (・_・;) GET /pods/$pod?includeMachine=true named no machine.dataCenterId: $machine" >&2
-  # what RunPod rented out of the cards offered (machine.gpuTypeId; a CPU pod: its cpuFlavorId), said and recorded:
-  # 2026-11-06, two pods that ran nothing left no card name in the journal
-  card=$(field '(d.get("machine") or {}).get("gpuTypeId") or (d.get("gpu") or {}).get("id") or d.get("cpuFlavorId") or ""' <<<"$machine")
-  [ -n "$card" ] || echo "pod.sh: (・_・;) GET /pods/$pod?includeMachine=true named no machine.gpuTypeId, gpu.id or cpuFlavorId: $machine" >&2
-  # the pod's RAM (Pod.memoryInGb): the container has no cgroup memory limit (memory.max "max", MemTotal the host's
-  # 540 GB, 2026-10-14), so this is the RAM podd packs against
-  memory_gb=$(field 'd.get("memoryInGb") or ""' <<<"$created")
-  [ -n "$memory_gb" ] || echo "pod.sh: (・_・;) the create response carries no memoryInGb: $created" >&2
-  # the pod's container disk as RunPod made it (Pod.containerDiskInGb): podd matches requires.disk_gb_min against it
-  container_disk_gb=$(field 'd.get("containerDiskInGb") or ""' <<<"$created")
-  [ -n "$container_disk_gb" ] || echo "pod.sh: (・_・;) the create response carries no containerDiskInGb: $created" >&2
+  # What the v2 Pod says (openapi.json Pod): `cost` ($/h); `dataCenterId` (assigned by the scheduler: read again
+  # from GET /v2/pods/{id} when the create answer has none yet); the card or flavor rented, `gpu.id` / `cpu.id`
+  # (2026-11-06: two pods that ran nothing left no card name in the journal); the pod's RAM, `gpu.memory` /
+  # `cpu.memory` (the container has no cgroup memory limit, memory.max "max", MemTotal the host's 540 GB, 2026-10-14,
+  # so this is the RAM podd packs against); its container disk, `disk` (podd matches requires.disk_gb_min against
+  # it). None of these reads may stop the create here: a missing field is said loudly and recorded as null.
+  cost_per_hr=$(field 'd.get("cost") or ""' <<<"$created")
+  [ -n "$cost_per_hr" ] || echo "pod.sh: (・_・;) the create response carries no cost: $created" >&2
+  datacenter=$(field 'd.get("dataCenterId") or ""' <<<"$created")
+  if [ -z "$datacenter" ]; then
+    datacenter=$(rest GET "/pods/$pod" | field 'd.get("dataCenterId") or ""')
+    [ -n "$datacenter" ] || echo "pod.sh: (・_・;) neither the create nor GET /pods/$pod named a dataCenterId: $created" >&2
+  fi
+  card=$(field '(d.get("gpu") or {}).get("id") or (d.get("cpu") or {}).get("id") or ""' <<<"$created")
+  [ -n "$card" ] || echo "pod.sh: (・_・;) the create response named no gpu.id or cpu.id: $created" >&2
+  memory_gb=$(field '(d.get("gpu") or {}).get("memory") or (d.get("cpu") or {}).get("memory") or ""' <<<"$created")
+  [ -n "$memory_gb" ] || echo "pod.sh: (・_・;) the create response carries no gpu.memory or cpu.memory: $created" >&2
+  container_disk_gb=$(field 'd.get("disk") or ""' <<<"$created")
+  [ -n "$container_disk_gb" ] || echo "pod.sh: (・_・;) the create response carries no disk: $created" >&2
   COST=$cost_per_hr T0=$t0 DC=$datacenter CARD=$card MEMORY=$memory_gb DISK=$container_disk_gb python3 -c 'import json, os; print(json.dumps({"cost_per_hr": float(os.environ["COST"]) if os.environ["COST"] else None, "created_at_unix_s": int(os.environ["T0"]), "datacenter": os.environ["DC"] or None, "card": os.environ["CARD"] or None, "memory_gb": float(os.environ["MEMORY"]) if os.environ["MEMORY"] else None, "container_disk_gb": float(os.environ["DISK"]) if os.environ["DISK"] else None}))' > $POD_SESSION_FILE
   echo "pod $NAME ($pod) created: ${card:-an unnamed card} in ${datacenter:-an unnamed datacenter} at \$$cost_per_hr/h; waiting for its ssh port"
   # Every wait for the pod also watches its container (watch_the_container): one that does not stay up fails the
   # create in seconds, not after the 15 min below. Both waits: a failing container's ssh port flickers up (observed
   # 2026-10-30), so the port alone can pass the first wait into an ssh that never answers.
   failed_container_starts=0 last_container_uptime=""
-  until rest GET /pods/$pod | field 'd.get("publicIp") and (d.get("portMappings") or {}).get("22") or ""' | grep -q .; do
-    watch_the_container "$pod"
-    [ $(( $(date +%s) - t0 )) -lt 900 ] || { echo "pod $NAME ($pod): no public ssh port after 15 min" >&2; exit 1; }
-    sleep 5
-  done
+  wait_for_the_ssh_port "$pod"
   "$0" ssh-config "$NAME"
   until ssh -o ConnectTimeout=5 -o BatchMode=yes $SSH_ALIAS true 2>/dev/null; do
     watch_the_container "$pod"
@@ -230,6 +270,34 @@ create_the_pod() {
   done
   echo "pod $NAME: ssh up $(( $(date +%s) - t0 )) s after create; container started (image pulled) $(( $(ssh $SSH_ALIAS 'date -d "$(ps -o lstart= -p 1)" +%s') - t0 )) s after create"
   ssh $SSH_ALIAS 'if command -v nvidia-smi >/dev/null; then nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; else echo "no card (a CPU pod): cpuset $(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || echo none), cgroup cpu.max $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo none)"; fi'
+}
+
+# ssh_endpoint <pod id>: one word-pair. "<host> <port>": the pod's direct ssh (v2 Pod.ssh.direct: null until 22/tcp
+# is mapped; the docs: check status RUNNING before connecting); "GONE <status>": RunPod put the pod in ERROR or
+# TERMINATED (migrate-from-v1.mdx: "Handle ERROR in polling loops"); nothing: not yet, or RunPod did not answer this
+# time (said loudly; the caller's wait is bounded).
+ssh_endpoint() {
+  ask GET "/pods/$1"
+  if [[ $ANSWER_CODE != 2* ]]; then
+    echo "pod.sh: (・_・;) RunPod GET /pods/$1 -> HTTP $ANSWER_CODE: ${ANSWER:0:300} (the wait goes on)" >&2
+    return 0
+  fi
+  field '"GONE " + d["status"] if d.get("status") in ("ERROR", "TERMINATED") else "%s %s" % (d["ssh"]["direct"]["host"], d["ssh"]["direct"]["port"]) if d.get("status") == "RUNNING" and (d.get("ssh") or {}).get("direct") else ""' <<<"$ANSWER"
+}
+
+# wait_for_the_ssh_port <pod id>: until ssh_endpoint names the port, watching the container (watch_the_container)
+# every turn; a pod RunPod calls ERROR / TERMINATED, or no port after 15 min, fails the create (exit 1: podd's "did
+# not boot")
+wait_for_the_ssh_port() {
+  local endpoint
+  while :; do
+    endpoint=$(ssh_endpoint "$1")
+    if [[ $endpoint == GONE* ]]; then echo "pod $NAME ($1): RunPod says the pod is ${endpoint#GONE } while it boots" >&2; exit 1; fi
+    [ -z "$endpoint" ] || return 0
+    watch_the_container "$1"
+    [ $(( $(date +%s) - t0 )) -lt 900 ] || { echo "pod $NAME ($1): no public ssh port after 15 min" >&2; exit 1; }
+    sleep 5
+  done
 }
 
 # one pod's files, by its name (a name is podd's: letters, digits, dashes)
@@ -301,27 +369,26 @@ create)
   MIN_VCPU=${5:?pod.sh create <name> <image> <cards> <min vCPU> <disk GB>}
   DISK_GB=$(whole_gb "${6:-}")
   DATACENTERS=$(datacenters_json "${7:-}")
-  # PodCreateInput (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json): ports 22/tcp only (full ssh, no
-  # Jupyter); containerDiskInGb <disk GB>, podd's default 30 (daemon.py GPU_CONTAINER_DISK_GB; more when a job's
-  # requires.disk_gb_min asks: the image does not count against it: / showed 16 MB used with /opt at 5.7 GB,
-  # 2026-10-04); volumeInGb 0 (no pod volume: results come home); env {}: no PUBLIC_KEY, so RunPod injects the
-  # account's ssh keys ($SECRETS/ssh_ed25519.pub is one of them); no dockerEntrypoint/StartCmd: the image's.
-  # NO allowedCudaVersions: its enum stops at 13.0 (PodCreateInput), so any list of versions shuts out every host with
-  # a newer driver (2026-10-29: the only stock under the cap was there; every create "no instances" for 30+ min, and
-  # created at once without the field). podd measures the driver on the pod and deletes one below min_cuda_version
-  # (daemon.py old_driver). dataCenterIds only to avoid podd's avoided datacenters (RUNPOD_DATACENTERS less them);
-  # else none: any datacenter.
-  body=$(IMAGE=$IMAGE CARDS=$CARDS MIN_VCPU=$MIN_VCPU DISK_GB=$DISK_GB NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
+  # CreatePodRequest (references/runpod/docs/api-reference-v2/openapi.json; v2 answers a field it does not take with
+  # a 422): cloud SECURE; gpu {count 1, minVcpuCountPerGpu <min vCPU>}, its id set per card by create_the_pod; ports
+  # 22/tcp only (full ssh, no Jupyter; v2 has no default ports); disk <disk GB>, podd's default 30 (daemon.py
+  # GPU_CONTAINER_DISK_GB; more when a job's requires.disk_gb_min asks: the image does not count against it: / showed
+  # 16 MB used with /opt at 5.7 GB, 2026-10-04); no mounts (no pod volume: results come home; podd's /workspace is a
+  # directory on the container disk); env {}; startSsh: RunPod injects the account's ssh keys as PUBLIC_KEY
+  # ($SECRETS/ssh_ed25519.pub is one of them; v2 does so only when asked, v1 always did); no entrypoint/cmd: the
+  # image's. NO gpu.allowedCudaVersions / minCudaVersion: podd measures the driver on the pod and deletes one below
+  # min_cuda_version (daemon.py old_driver; 2026-10-29: v1's allowedCudaVersions enum stopped at 13.0 and shut out
+  # every newer host). dataCenterIds only to avoid podd's avoided datacenters (RUNPOD_DATACENTERS less them); else
+  # none: any datacenter.
+  body=$(IMAGE=$IMAGE MIN_VCPU=$MIN_VCPU DISK_GB=$DISK_GB NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
 import json, os
-body = {"name": os.environ["NAME"], "imageName": os.environ["IMAGE"], "cloudType": "SECURE",
-    "gpuCount": 1, "gpuTypeIds": os.environ["CARDS"].split(","), "gpuTypePriority": "custom",
-    "minVCPUPerGPU": int(os.environ["MIN_VCPU"]),
-    "ports": ["22/tcp"], "containerDiskInGb": int(os.environ["DISK_GB"]), "volumeInGb": 0, "volumeMountPath": "/workspace", "env": {},
-    "supportPublicIp": True}
+body = {"name": os.environ["NAME"], "image": os.environ["IMAGE"], "cloud": "SECURE",
+    "gpu": {"count": 1, "minVcpuCountPerGpu": int(os.environ["MIN_VCPU"])},
+    "ports": ["22/tcp"], "disk": int(os.environ["DISK_GB"]), "env": {}, "startSsh": True}
 if json.loads(os.environ["DATACENTERS"]) is not None:
     body["dataCenterIds"] = json.loads(os.environ["DATACENTERS"])
 print(json.dumps(body))')
-  create_the_pod "$NAME" "$body"
+  create_the_pod "$NAME" gpu "$CARDS" "$body"
   ;;
 create-cpu)
   name_the_pod "${2:-}"
@@ -330,24 +397,22 @@ create-cpu)
   VCPU=${5:?pod.sh create-cpu <name> <image> <flavors> <vCPU> <disk GB>}
   DISK_GB=$(whole_gb "${6:-}")
   DATACENTERS=$(datacenters_json "${7:-}")
-  # PodCreateInput with computeType CPU (references/runpod/runpod-rest-api-openapi-v1-2026-10-10.json; the docs
-  # mirror references/runpod/, tools/mirror_runpod_docs.sh): cpuFlavorIds in podd's order (cpuFlavorPriority
-  # custom), vcpuCount (a power of two: api-reference-v2 BaseCpuConfig), the RAM is the flavor's per-vCPU multiple.
-  # containerDiskInGb <disk GB>, podd's default 20 (daemon.py CPU_CONTAINER_DISK_GB): the CPU flavors cap the disk at
+  # CreatePodRequest with cpu (references/runpod/docs/api-reference-v2/openapi.json; the docs mirror
+  # references/runpod/, tools/mirror_runpod_docs.sh): cpu {vcpuCount <vCPU>} (a power of two: BaseCpuConfig), its id
+  # set per flavor by create_the_pod in podd's order; RunPod derives the RAM from the flavor's per-vCPU multiple. The
+  # rest as create. disk <disk GB>, podd's default 20 (daemon.py CPU_CONTAINER_DISK_GB): the CPU flavors cap the disk at
   # 10 GB per vCPU (cpu3*: GraphQL cpuFlavors.diskLimitPerVcpu, 2026-10-15), so 20 fits every size from 2 vCPU, and a
   # larger requires.disk_gb_min gets the vCPUs for it from podd's cpu_pod_plan (or no plan, said there, never a
   # create RunPod refuses); the image does not count against it. No CUDA, no card.
-  body=$(IMAGE=$IMAGE FLAVORS=$FLAVORS VCPU=$VCPU DISK_GB=$DISK_GB NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
+  body=$(IMAGE=$IMAGE VCPU=$VCPU DISK_GB=$DISK_GB NAME=$NAME DATACENTERS=$DATACENTERS python3 -c '
 import json, os
-body = {"name": os.environ["NAME"], "imageName": os.environ["IMAGE"], "cloudType": "SECURE",
-    "computeType": "CPU", "cpuFlavorIds": os.environ["FLAVORS"].split(","), "cpuFlavorPriority": "custom",
-    "vcpuCount": int(os.environ["VCPU"]), "ports": ["22/tcp"], "containerDiskInGb": int(os.environ["DISK_GB"]),
-    "volumeInGb": 0,
-    "volumeMountPath": "/workspace", "env": {}, "supportPublicIp": True}
+body = {"name": os.environ["NAME"], "image": os.environ["IMAGE"], "cloud": "SECURE",
+    "cpu": {"vcpuCount": int(os.environ["VCPU"])}, "ports": ["22/tcp"], "disk": int(os.environ["DISK_GB"]),
+    "env": {}, "startSsh": True}
 if json.loads(os.environ["DATACENTERS"]) is not None:
     body["dataCenterIds"] = json.loads(os.environ["DATACENTERS"])
 print(json.dumps(body))')
-  create_the_pod "$NAME" "$body"
+  create_the_pod "$NAME" cpu "$FLAVORS" "$body"
   ;;
 avail-cpu)
   FLAVORS=${2:?pod.sh avail-cpu <flavors, comma-separated> (the cpu_flavors of ~/.config/podd/config.json)}
@@ -380,7 +445,9 @@ ssh-config)
   name_the_pod "${2:-}"
   [ -s $SECRETS/ssh_ed25519 ] || { echo "pod.sh: no ssh key $SECRETS/ssh_ed25519" >&2; exit 1; }
   pod=$(pod_id)
-  read -r ip port < <(rest GET /pods/$pod | field 'd["publicIp"] + " " + str(d["portMappings"]["22"])')
+  endpoint=$(ssh_endpoint "$pod")
+  [[ -n $endpoint && $endpoint != GONE* ]] || { echo "pod.sh: pod $NAME ($pod) has no direct ssh port (${endpoint:-not RUNNING with 22/tcp mapped})" >&2; exit 1; }
+  read -r ip port <<<"$endpoint"
   ssh_config write "$ip" "$port"
   ssh-keygen -R "[$ip]:$port" >/dev/null 2>&1 || true
   echo "$SSH_ALIAS -> $ip:$port"
@@ -393,12 +460,22 @@ recorded)
   for id_file in $PODS_DIRECTORY/*.id; do [ -s "$id_file" ] && basename "$id_file" .id; done 2>/dev/null || true
   ;;
 account)
-  rest GET /pods | field '"\n".join("%s %s %s $%s/h" % (p.get("id"), p.get("name"), p.get("desiredStatus"), p.get("costPerHr")) for p in d) or "(no pods on the account)"'
+  # GET /v2/pods: {"pods": [...], "pagination": {hasNextPage, nextCursor}}, up to 1000 a page: every page is read
+  # (migrate-from-v1.mdx, "List responses")
+  cursor="" listed=0
+  while :; do
+    page=$(rest GET "/pods?limit=1000${cursor:+&cursor=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$cursor")}")
+    lines=$(field '"\n".join("%s %s %s $%s/h" % (p.get("id"), p.get("name"), p.get("status"), p.get("cost")) for p in d["pods"])' <<<"$page")
+    [ -z "$lines" ] || { echo "$lines"; listed=1; }
+    cursor=$(field '((d.get("pagination") or {}).get("nextCursor") or "") if (d.get("pagination") or {}).get("hasNextPage") else ""' <<<"$page")
+    [ -n "$cursor" ] || break
+  done
+  [ "$listed" = 1 ] || echo "(no pods on the account)"
   ;;
 status)
   name_the_pod "${2:-}"
   pod=$(pod_id)
-  rest GET /pods/$pod | field '{k: d.get(k) for k in ("id", "name", "desiredStatus", "costPerHr", "publicIp", "portMappings")}'
+  rest GET /pods/$pod | field '{**{k: d.get(k) for k in ("id", "name", "status", "cost", "dataCenterId")}, "ssh": (d.get("ssh") or {}).get("direct")}'
   ssh -o ConnectTimeout=5 $SSH_ALIAS 'if command -v nvidia-smi >/dev/null; then nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; else echo "no card (a CPU pod)"; fi'
   ;;
 delete)
@@ -413,7 +490,7 @@ minutes = (time.time() - session["created_at_unix_s"]) / 60
 rate = session["cost_per_hr"]
 card = session.get("card") or "card not recorded"
 if rate is None:
-    print("pod %s (%s) deleted after %.1f min; (・_・;) its create response carried no costPerHr, so no cost" % (sys.argv[2], card, minutes))
+    print("pod %s (%s) deleted after %.1f min; (・_・;) its create response carried no cost per hour, so no total" % (sys.argv[2], card, minutes))
 else:
     print("pod %s (%s) deleted after %.1f min at $%.2f/h: $%.4f this session" % (sys.argv[2], card, minutes, rate, rate * minutes / 60))' $POD_SESSION_FILE "$NAME ($pod)"
   else
@@ -423,6 +500,6 @@ else:
   rm -f $POD_SESSION_FILE $POD_LEASE_FILE; rm $POD_ID_FILE
   ;;
 *)
-  sed -n '2,34p' "$0"; exit 1
+  sed -n '2,35p' "$0"; exit 1
   ;;
 esac

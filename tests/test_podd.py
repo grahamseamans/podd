@@ -600,8 +600,8 @@ def test_pod_sh_create_exiting_75_is_a_no_pod_miss_with_runpods_answer_not_a_boo
     finally:
         podd.POD_SCRIPT = saved
     assert pod.state == "no stock" and "no instances currently available" in pod.problem, (pod.state, pod.problem)
-    assert "exit 75" in (PACKAGE_DIRECTORY / "pod.sh").read_text() and '*"no instances"*' in \
-        (PACKAGE_DIRECTORY / "pod.sh").read_text(), "pod.sh maps RunPod's no-instances answer to exit 75"
+    # that the real pod.sh exits 75 for RunPod's no-instances answers: test_pod_sh_create_speaks_runpods_rest_v2_...
+    # and test_pod_sh_create_cpu_asks_runpod_for_a_cpu_pod_of_the_flavors_and_vcpu run it against a fake curl
 
 
 def did_not_boot(pool):
@@ -1010,8 +1010,11 @@ def test_every_pod_sh_command_reaches_its_own_arm():
 # 7b1. a container that does not stay up fails the create in seconds (2026-10-29 16:42: a pod whose container never
 # started was found out only by the 15 min wait for its ssh port). The REAL pod.sh create against a fake curl and ssh:
 # RunPod's answers are what throwaway pods answered 2026-10-30 (pod.sh, THE CONTAINER WHILE A POD BOOTS).
-POD_WITHOUT_PORTS = '{"id": "pod-z", "publicIp": "", "portMappings": null}'
-POD_WITH_PORTS = '{"id": "pod-z", "publicIp": "66.92.198.138", "portMappings": {"22": 11053}}'
+POD_WITHOUT_PORTS = '{"id": "pod-z", "status": "STARTING", "ssh": {"proxy": null, "direct": null}}'   # REST v2 Pod
+POD_WITH_PORTS = ('{"id": "pod-z", "status": "RUNNING", "ssh": {"proxy": null, "direct": {"host": "66.92.198.138", '
+                  '"port": 11053, "username": "root", "command": "ssh root@66.92.198.138 -p 11053"}}}')
+POD_CREATED = ('{"id": "pod-z", "status": "PROVISIONING", "cost": 0.59, "gpu": {"id": "NVIDIA L4", "count": 1, '
+               '"vcpuCount": 12, "memory": 94}, "disk": 30, "dataCenterId": "US-MO-2"}')       # POST /v2/pods' 201
 
 
 def runtime_answer(uptime):
@@ -1019,11 +1022,14 @@ def runtime_answer(uptime):
     return json.dumps({"data": {"pod": {"runtime": None if uptime is None else {"uptimeInSeconds": uptime}}}})
 
 
-def pod_sh_create_against(rest_pod_answers, graphql_answers, ssh_answers):
+def pod_sh_create_against(rest_pod_answers, graphql_answers, ssh_answers, create_answers=(("201", POD_CREATED),),
+                          cards="NVIDIA L4"):
     """The real pod.sh create podd-z with curl and ssh faked first on PATH. rest_pod_answers: GET /pods/pod-z's bodies
     in turn (the last one repeats); graphql_answers: one body per GraphQL call ("FAIL <body>": curl fails, as
     --fail-with-body does on an HTTP error); ssh_answers: whether `ssh <alias> true` gets in, in turn (the last
-    repeats). -> (the finished process, the seconds it took)."""
+    repeats); create_answers: (HTTP status, body) of each POST /v2/pods in turn (the last repeats). Every call's
+    method, URL and body are kept in $HOME/curl-calls (one JSON line each). -> (the finished process, the seconds it
+    took, the calls, the session file pod.sh wrote or None)."""
     root = Path(tempfile.mkdtemp(prefix="podsh-container-"))
     (root / ".secrets" / "runpod").mkdir(mode=0o700, parents=True)
     (root / ".secrets" / "runpod" / "api_key").write_text("not-a-key\n")
@@ -1032,19 +1038,21 @@ def pod_sh_create_against(rest_pod_answers, graphql_answers, ssh_answers):
     (root / "rest-pod-answers").write_text("".join(answer + "\n" for answer in rest_pod_answers))
     (root / "graphql-answers").write_text("".join(answer + "\n" for answer in graphql_answers))
     (root / "ssh-answers").write_text("".join(("0" if gets_in else "255") + "\n" for gets_in in ssh_answers))
+    (root / "create-answers").write_text("".join(f"{code} {body}\n" for code, body in create_answers))
     next_answer = ('next_answer() { local answer; answer=$(head -1 "$1"); '
                    '[ "$(wc -l < "$1")" -gt 1 ] && sed -i 1d "$1"; printf "%s" "$answer"; }\n')
     fake_curl = root / "bin" / "curl"
     fake_curl.write_text("#!/usr/bin/env bash\n" + next_answer +
-                         'method=GET; url=""; previous=""\n'
+                         'method=GET; url=""; previous=""; data=""\n'
                          'for argument in "$@"; do [ "$previous" = -X ] && method=$argument; '
+                         '[ "$previous" = --data ] && data=$argument; '
                          'case $argument in https://*) url=$argument;; esac; previous=$argument; done\n'
+                         'METHOD=$method URL=$url DATA=$data python3 -c \'import json, os; print(json.dumps({k: '
+                         'os.environ[k.upper()] for k in ("method", "url", "data")}))\' >> "$HOME/curl-calls"\n'
                          'case "$method $url" in\n'
-                         '"POST https://rest.runpod.io/v1/pods") printf \'%s\\n200\' \'{"id": "pod-z", "costPerHr": '
-                         '0.59, "memoryInGb": 94, "containerDiskInGb": 30}\';;\n'
-                         '"GET https://rest.runpod.io/v1/pods/pod-z?includeMachine=true") printf \'%s\\n200\' '
-                         '\'{"id": "pod-z", "machine": {"dataCenterId": "US-MO-2"}}\';;\n'
-                         '"GET https://rest.runpod.io/v1/pods/pod-z") printf \'%s\\n200\' '
+                         '"POST https://api.runpod.io/v2/pods") answer=$(next_answer "$HOME/create-answers"); '
+                         'printf \'%s\\n%s\' "${answer#* }" "${answer%% *}";;\n'
+                         '"GET https://api.runpod.io/v2/pods/pod-z") printf \'%s\\n200\' '
                          '"$(next_answer "$HOME/rest-pod-answers")";;\n'
                          '"GET https://api.runpod.io/graphql")\n'
                          '  answer=$(head -1 "$HOME/graphql-answers"); sed -i 1d "$HOME/graphql-answers"\n'
@@ -1067,19 +1075,22 @@ def pod_sh_create_against(rest_pod_answers, graphql_answers, ssh_answers):
     environment.pop("PODD_SECRETS", None)
     started_s = time.time()
     try:
-        created = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), "create", "podd-z", IMAGE_A, "NVIDIA L4", "4",
+        created = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), "create", "podd-z", IMAGE_A, cards, "4",
                                   "30"], capture_output=True, text=True, env=environment, stdin=subprocess.DEVNULL,
                                  timeout=120)
     finally:   # the watchdog pod.sh armed ends once no pod is recorded under the name (within its 60 s sleep)
         (root / ".secrets" / "runpod" / "pods" / "podd-z.id").unlink(missing_ok=True)
-    return created, time.time() - started_s
+    calls_file, session_file = root / "curl-calls", root / ".secrets" / "runpod" / "pods" / "podd-z.session.json"
+    calls = [json.loads(line) for line in calls_file.read_text().splitlines()] if calls_file.exists() else []
+    session = json.loads(session_file.read_text()) if session_file.exists() else None
+    return created, time.time() - started_s, calls, session
 
 
 def test_a_container_that_keeps_restarting_fails_the_create_in_seconds_even_after_its_ssh_port_flickered_up():
     """2026-10-30 (pod.sh): a failing container's ssh port was mapped for a moment, so the port wait passed and ssh
     never got in; RunPod's uptime went back (a restart) and below 0. Two failed starts fail the create: exit 1, which
     podd takes as a pod that did not boot (a miss of its set's wait, the pod deleted)."""
-    created, took_s = pod_sh_create_against([POD_WITH_PORTS], [runtime_answer(37), runtime_answer(2),
+    created, took_s, _, _ = pod_sh_create_against([POD_WITH_PORTS], [runtime_answer(37), runtime_answer(2),
                                                                runtime_answer(-4)], [False])
     assert created.returncode == 1, (created.returncode, created.stdout[-500:], created.stderr[-1500:])
     assert "uptimeInSeconds 2 after 37), failed start 1 of 2" in created.stderr, created.stderr[-1500:]
@@ -1091,7 +1102,7 @@ def test_a_container_that_keeps_restarting_fails_the_create_in_seconds_even_afte
 def test_a_container_that_starts_boots_through_runpod_not_answering_and_never_counts_a_failed_start():
     """A container not started yet (runtime null) and RunPod's GraphQL not answering (HTTP 503 "Service Unavailable",
     seen 2026-10-30 while polling; and a 200 with no data) are waited through, each said; a rising uptime is fine."""
-    created, _ = pod_sh_create_against(
+    created, _, _, _ = pod_sh_create_against(
         [POD_WITHOUT_PORTS, POD_WITHOUT_PORTS, POD_WITHOUT_PORTS, POD_WITH_PORTS],
         ['FAIL {"message":"Service Unavailable"}', '{"message":"Service Unavailable"}', runtime_answer(None),
          runtime_answer(0), runtime_answer(6)], [False, True])
@@ -1108,9 +1119,51 @@ def test_a_container_answer_pod_sh_does_not_know_fails_the_create_loudly_at_once
                           "a container runtime pod.sh does not know"),
                          ('{"data": {"pod": {"runtime": {"uptime": 12}}}}', "a container runtime pod.sh does not know"),
                          ('{"data": {"pod": null}}', "RunPod GraphQL has no pod pod-z any more")):
-        created, took_s = pod_sh_create_against([POD_WITHOUT_PORTS], [answer], [False])
+        created, took_s, _, _ = pod_sh_create_against([POD_WITHOUT_PORTS], [answer], [False])
         assert created.returncode == 1 and said in created.stderr, (answer, created.returncode, created.stderr[-800:])
         assert answer[:40] in created.stderr and took_s < 20, (answer, took_s, created.stderr[-800:])
+
+
+# 7b1a. RunPod's REST v2 (2026-11-26: REST v1's host rest.runpod.io was gone, NXDOMAIN, v1 retired 2026-11-15, and
+# every create failed with curl's "Could not resolve host"). v2 rejects a field it does not know (422), takes ONE card
+# per create (no fallback list), answers capacity with a 400 and a human detail, and puts the ssh port in
+# Pod.ssh.direct. The fields v2 takes, from references/runpod/docs/api-reference-v2/openapi.json (mirror c845f73,
+# 2026-11-25): CreatePodRequest + ContainerConfig, CreateGpuConfig, CreateCpuConfig.
+CREATE_POD_REQUEST_FIELDS = {"name", "cloud", "cpu", "dataCenterIds", "globalNetworking", "gpu", "mounts",
+                             "startJupyter", "startSsh", "templateId", "queue", "args", "cmd", "entrypoint", "disk",
+                             "env", "image", "ports", "registry"}
+CREATE_GPU_CONFIG_FIELDS = {"id", "count", "allowedCudaVersions", "minCudaVersion", "minRamPerGpu",
+                            "minVcpuCountPerGpu"}
+NO_PLACEMENT = json.dumps({"title": "Bad Request", "status": 400,
+                           "detail": "this GPU and data center combination could not be placed"})
+
+
+def test_pod_sh_create_speaks_runpods_rest_v2_one_card_at_a_time():
+    created, _, calls, session = pod_sh_create_against(
+        [POD_WITHOUT_PORTS, POD_WITH_PORTS], [runtime_answer(6)], [True],
+        create_answers=(("400", NO_PLACEMENT), ("201", POD_CREATED)), cards="NVIDIA RTX A4500,NVIDIA L4")
+    assert created.returncode == 0, (created.returncode, created.stdout[-500:], created.stderr[-1500:])
+    rest_urls = [call["url"] for call in calls if "graphql" not in call["url"]]
+    assert rest_urls and all(url.startswith("https://api.runpod.io/v2/pods") for url in rest_urls), rest_urls
+    bodies = [json.loads(call["data"]) for call in calls if call["method"] == "POST" and "graphql" not in call["url"]]
+    assert [body["gpu"]["id"] for body in bodies] == ["NVIDIA RTX A4500", "NVIDIA L4"], "the next card after a 400"
+    for body in bodies:
+        assert set(body) <= CREATE_POD_REQUEST_FIELDS and set(body["gpu"]) <= CREATE_GPU_CONFIG_FIELDS, body
+        assert body["startSsh"] is True and body["ports"] == ["22/tcp"] and body["gpu"]["count"] == 1, body
+    assert session == {**session, "cost_per_hr": 0.59, "datacenter": "US-MO-2", "card": "NVIDIA L4",
+                       "memory_gb": 94.0, "container_disk_gb": 30.0}, session
+    assert "runpod-podd-z -> 66.92.198.138:11053" in created.stdout, created.stdout[-800:]
+    # every card refused for stock: exit 75 (a no-pod miss); refused for anything else: exit 1; a 422 stops at once
+    for answers, exit_code, posts in (((("400", NO_PLACEMENT),), podd.POD_SH_NO_STOCK_EXIT, 2),
+                                      ((("400", '{"title": "Bad Request", "status": 400, "detail": "gpu.count too '
+                                                'large"}'),), 1, 2),
+                                      ((("422", '{"title": "Unprocessable", "status": 422, "errors": ["$: additional '
+                                                'properties \'bogus\' not allowed"]}'),), 1, 1)):
+        refused, took_s, calls, _ = pod_sh_create_against([POD_WITHOUT_PORTS], [runtime_answer(None)], [False],
+                                                          create_answers=answers, cards="NVIDIA RTX A4500,NVIDIA L4")
+        assert refused.returncode == exit_code and answers[0][1][:30] in refused.stderr, (answers, refused.returncode,
+                                                                                         refused.stderr[-800:])
+        assert sum(call["method"] == "POST" for call in calls) == posts and took_s < 20, (answers, calls)
 
 
 # 7b2. a failed delete is said and retried, never podd's end (2026-10-15: RunPod's DELETE answered HTTP 500 "unexpected
@@ -1277,14 +1330,15 @@ def test_gpu_and_cpu_pods_are_capped_apart():
 
 
 def test_pod_sh_create_cpu_asks_runpod_for_a_cpu_pod_of_the_flavors_and_vcpu():
-    """The REAL pod.sh create-cpu against a fake curl (first on PATH) that records the request and answers RunPod's
-    no-instances 500: pod.sh exits 75 and the body it sent is the CPU PodCreateInput."""
+    """The REAL pod.sh create-cpu against a fake curl (first on PATH) that records each request and answers RunPod's
+    no-instances 500: pod.sh asks for each flavor in turn (REST v2 takes one per create), then exits 75; each body
+    is the v2 CPU CreatePodRequest."""
     root = Path(tempfile.mkdtemp(prefix="podsh-cpu-"))
     (root / ".secrets" / "runpod").mkdir(mode=0o700, parents=True)
     (root / ".secrets" / "runpod" / "api_key").write_text("not-a-key\n")
     (root / "bin").mkdir()
     fake_curl = root / "bin" / "curl"
-    fake_curl.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$HOME/curl-args\"\n"
+    fake_curl.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >> \"$HOME/curl-args\"\n"
                          "printf '%s\\n500' '{\"error\":\"create pod: There are no instances currently available\"}'\n")
     fake_curl.chmod(0o755)
     environment = {**os.environ, "HOME": str(root), "PATH": f"{root / 'bin'}:{os.environ['PATH']}"}
@@ -1292,10 +1346,11 @@ def test_pod_sh_create_cpu_asks_runpod_for_a_cpu_pod_of_the_flavors_and_vcpu():
                              capture_output=True, text=True, env=environment, stdin=subprocess.DEVNULL)
     assert created.returncode == podd.POD_SH_NO_STOCK_EXIT, (created.returncode, created.stderr)
     arguments = (root / "curl-args").read_text().splitlines()
-    body = json.loads(arguments[arguments.index("--data") + 1])
-    assert body["computeType"] == "CPU" and body["cpuFlavorIds"] == ["cpu3g", "cpu3c"] and body["vcpuCount"] == 8
-    assert body["cpuFlavorPriority"] == "custom" and body["imageName"] == IMAGE_A and "gpuTypeIds" not in body
-    assert body["containerDiskInGb"] <= 10 * 2, "fits the smallest CPU pod's disk cap (10 GB a vCPU, 2 vCPU)"
+    bodies = [json.loads(arguments[index + 1]) for index, argument in enumerate(arguments) if argument == "--data"]
+    assert [body["cpu"] for body in bodies] == [{"vcpuCount": 8, "id": "cpu3g"}, {"vcpuCount": 8, "id": "cpu3c"}], bodies
+    for body in bodies:
+        assert body["image"] == IMAGE_A and "gpu" not in body and body["startSsh"] is True, body
+        assert body["disk"] <= 10 * 2, "fits the smallest CPU pod's disk cap (10 GB a vCPU, 2 vCPU)"
     assert "not-a-key" not in "\n".join(arguments), "the key reaches curl only through a header file"
     fake_curl.write_text("#!/usr/bin/env bash\nprintf '%s\\n500' '{\"error\":\"create pod: There are no longer any "
                          "instances available with the requested specifications.\"}'\n")    # a CPU size out, 2026-10-15
@@ -1788,12 +1843,13 @@ def test_pod_sh_create_avoids_the_slow_datacenters():
     assert "EU-RO-1" in body["dataCenterIds"] and len(body["dataCenterIds"]) == 28, body["dataCenterIds"]
     body, _ = body_of("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "30", "US-MD-1")
     assert "US-MD-1" not in body["dataCenterIds"] and len(body["dataCenterIds"]) == 29
-    assert body["containerDiskInGb"] == 30
-    assert "allowedCudaVersions" not in body, "any host: RunPod's enum stops at 13.0 (podd measures the driver)"
+    assert body["disk"] == 30
+    assert "allowedCudaVersions" not in body["gpu"] and "minCudaVersion" not in body["gpu"], \
+        "any host (podd measures the driver)"
     body, _ = body_of("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "80")
-    assert body["containerDiskInGb"] == 80 and "dataCenterIds" not in body, body
+    assert body["disk"] == 80 and "dataCenterIds" not in body, body
     body, _ = body_of("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "80")
-    assert body["containerDiskInGb"] == 80, body
+    assert body["disk"] == 80, body
     for arguments in (("create", "podd-9", IMAGE_A, "NVIDIA A40", "8", "12.8", "30"),   # the old call: cuda versions
                       ("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8", "79.5"), ("create-cpu", "podd-9", IMAGE_A, "cpu3c", "8")):
         refused = subprocess.run([str(PACKAGE_DIRECTORY / "pod.sh"), *arguments], capture_output=True, text=True,
