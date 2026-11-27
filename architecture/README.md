@@ -77,7 +77,8 @@ THE PATTERN.
   Everything else (facts, packing, idle, stock) is the GPU pods'.
 - No pod yet is waited out, not failed: pod.sh create exits 75 when RunPod has no instance of any card offered
   (2026-10-14: six jobs FAILED on one "no instances currently available"); the jobs stay JOB, podd says it loudly (and
-  in the status file) and retries one pod after 60 s doubling to 10 min, avoiding no slow datacenter, and only a set with
+  in the status file) and retries one pod after 60 s doubling to 10 min, avoiding no slow datacenter (an old driver's
+  and a did-not-boot one's still), and only a set with
   NO pod for max_wait_for_a_pod_minutes FAILS, with every miss: the clock runs only while no pod serves the set
   (2026-10-22: 20 jobs FAILED while 3 pods of their set ran).
 - A pod that did not boot is a miss of that same wait, not a failure of its own (2026-10-29: pod.sh create exited 1,
@@ -124,6 +125,12 @@ THE PATTERN.
   all at once (fits_at_once: a packing, never a per-job width; 2026-11-06: five jobs opened five pods, two ran
   nothing). A booting pod is stopped and deleted when no waiting job is left for it, or when its ssh is not up
   BOOT_DEADLINE_FACTOR x boot_seconds after its create (a boot failure: a miss of its set) (Pool.cancel_boots).
+  A boot failure that is the host's -- past that deadline, or pod.sh create failing after RunPod made the pod (its
+  session file names the datacenter before ssh is up) -- has its datacenter avoided by creates of its kind for
+  DID_NOT_BOOT_DATACENTER_HOURS, even while its set waits, recorded before the same pass opens the replacement
+  (2026-11-13: US-CA-2 twice in a row; 2026-11-27: EU-CZ-1 picked again after it ran out the deadline). Not podd's own
+  steps after the create (an image without facts would ban a datacenter per retry), nor a pod whose record is gone
+  (a hand pod.sh delete: clients never call pod.sh).
   pod.sh records and says the card RunPod rented (REST v2 Pod gpu.id / cpu.id) on create and on delete.
 - Pods never outlive their work: idle -> deleted, podd stopped -> deleted (a booting create is stopped first), podd
   killed -> pod.sh's watchdog (its lease stops being renewed), podd started -> every pod pod.sh still records deleted.

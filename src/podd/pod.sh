@@ -125,6 +125,9 @@ field() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.ar
 # A FAILED START is a reading below 0, or below the one before (a restart). FAILED_CONTAINER_STARTS of them fail the
 # create (exit 1: podd's "did not boot", a miss of the set's wait; it deletes the pod).
 FAILED_CONTAINER_STARTS=2
+# the boot waits' poll (seconds; RunPod's own pace is ~5-30 s a reading, above): POD_SH_POLL_SECONDS overrides it
+# for the tests against a fake curl, which answer at once
+BOOT_POLL_SECONDS=${POD_SH_POLL_SECONDS:-5}
 
 # container_uptime <pod id>: the container's GraphQL runtime.uptimeInSeconds, one word: an integer, "none" (runtime
 # null: not started yet) or "unknown" (RunPod did not answer the question: said loudly, the wait goes on, bounded by
@@ -266,7 +269,7 @@ create_the_pod() {
   until ssh -o ConnectTimeout=5 -o BatchMode=yes $SSH_ALIAS true 2>/dev/null; do
     watch_the_container "$pod"
     [ $(( $(date +%s) - t0 )) -lt 900 ] || { echo "pod $NAME ($pod): ssh never answered" >&2; exit 1; }
-    sleep 5
+    sleep "$BOOT_POLL_SECONDS"
   done
   echo "pod $NAME: ssh up $(( $(date +%s) - t0 )) s after create; container started (image pulled) $(( $(ssh $SSH_ALIAS 'date -d "$(ps -o lstart= -p 1)" +%s') - t0 )) s after create"
   ssh $SSH_ALIAS 'if command -v nvidia-smi >/dev/null; then nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; else echo "no card (a CPU pod): cpuset $(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || echo none), cgroup cpu.max $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo none)"; fi'
@@ -296,7 +299,7 @@ wait_for_the_ssh_port() {
     [ -z "$endpoint" ] || return 0
     watch_the_container "$1"
     [ $(( $(date +%s) - t0 )) -lt 900 ] || { echo "pod $NAME ($1): no public ssh port after 15 min" >&2; exit 1; }
-    sleep 5
+    sleep "$BOOT_POLL_SECONDS"
   done
 }
 

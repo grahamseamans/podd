@@ -12,13 +12,15 @@ replaced and its datacenter avoided (never while its set is waiting for a pod), 
 from nvidia-smi and one below min_cuda_version is deleted with its jobs kept queued and its datacenter avoided (even
 while its set waits for a pod), a GPU create sends no allowedCudaVersions, a set waiting for a pod fails only after
 max_wait_for_a_pod_minutes with no pod, a pod that did not boot is a miss of that same wait (its set's jobs stay queued,
-a create follows the backoff) while a job no pod can hold still fails at once, a container RunPod keeps restarting
+a create follows the backoff, its datacenter avoided when the failure was the host's: past the boot deadline, or its
+create failed after RunPod made it) while a job no pod can hold still fails at once, a container RunPod keeps restarting
 fails the real pod.sh create in seconds (and an answer it does not know, at once), the deadline
 scales with expected_s and the pod's slowness, a CPU pod has its own price cap (max_cpu_price_per_hour, the cards' cap
 unless set), a running job's command.log and bring_home files come home every bring_home_every_s (a failed pull is
 loud, never fatal), and podd imports nothing but the standard library.
 
-    PYTHONPATH=src /usr/bin/python3 tests/test_podd.py      (from the repo root; or with podd installed)
+    PYTHONPATH=src /usr/bin/python3 tests/test_podd.py      (from the repo root; or with podd installed; ~7 s)
+    PYTHONPATH=src /usr/bin/python3 tests/test_podd.py boot  (only the tests whose name holds every word given)
 """
 import ast
 import contextlib
@@ -656,11 +658,20 @@ def test_a_pod_that_did_not_boot_is_a_miss_its_set_waits_retries_after_the_backo
     assert not pool.waiting_for_a_pod
 
 
+def record_a_session(pod, datacenter):
+    """What pod.sh create writes the moment RunPod made the pod (before its ssh is up)."""
+    pod.session_file.write_text(json.dumps({"cost_per_hr": 0.5, "created_at_unix_s": int(time.time()),
+                                            "datacenter": datacenter, "card": "NVIDIA GeForce RTX 3090",
+                                            "memory_gb": 46.0, "container_disk_gb": 30.0}))
+
+
 class PodThatBootsForever(PodThatDoesNotBoot):
-    """A pod whose create recorded its id and never ends by itself: its cancel and delete are recorded, never run."""
+    """A pod whose create recorded its id and session (podd-g1 in EU-CZ-1, any other in CA-MTL-1) and never ends by
+    itself: its cancel and delete are recorded, never run."""
     def start_booting(self):
         self.boot_started_s = time.time()
         self.pod_id_file.write_text(f"id-{self.name}")
+        record_a_session(self, "EU-CZ-1" if self.name == "podd-g1" else "CA-MTL-1")
         self.stopped = self.deleted = None
 
     def stop_booting(self):
@@ -692,6 +703,7 @@ def test_a_booting_pod_left_with_no_waiting_job_is_cancelled_and_one_past_the_bo
             pool.step()
             assert not pool.pods and pod.deleted.startswith("its boot was cancelled: surplus"), said.getvalue()[-400:]
             assert not pool.waiting_for_a_pod, "a surplus pod is no miss"
+            assert not podd.AVOIDED_DATACENTERS_FILE.exists(), "and no datacenter's fault"
 
         pool, queue_directory = no_pod_pool(Path(tempfile.mkdtemp(prefix="podd-deadline-")), jobs=1)
         with contextlib.redirect_stdout(io.StringIO()) as said:
@@ -704,11 +716,23 @@ def test_a_booting_pod_left_with_no_waiting_job_is_cancelled_and_one_past_the_bo
             pool.step()
             assert pod.cancel_reason.startswith(podd.BOOT_DEADLINE_SAID), pod.cancel_reason
             assert sorted(pool.pods) == ["podd-g1", "podd-g2"], "its job still waits: a fresh create replaces it"
+            # 2026-11-27: the 3090 in EU-CZ-1 past the deadline, and podd's next creates went back there
+            recorded = json.loads(podd.AVOIDED_DATACENTERS_FILE.read_text())
+            assert recorded["gpu"]["EU-CZ-1"]["because"] == "did not boot", recorded
+            assert podd.BOOT_DEADLINE_SAID in recorded["gpu"]["EU-CZ-1"]["why"], recorded
+            assert "EU-CZ-1 is recorded DID NOT BOOT for gpu pods" in said.getvalue(), said.getvalue()[-800:]
+            assert pool.pods["podd-g2"].avoid_datacenters == ["EU-CZ-1"], \
+                "the replacement opened in the cancel's own pass already avoids it (2026-11-13: US-CA-2 twice)"
             pool.step()
             assert sorted(pool.pods) == ["podd-g2"] and pod.deleted, said.getvalue()[-400:]
             wait = next(iter(pool.waiting_for_a_pod.values()))
             assert wait.misses == 1 and podd.BOOT_DEADLINE_SAID in wait.story[-1], wait.story
             assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir())
+            assert pool.avoided_datacenters("gpu", waiting_for_a_pod=True) == ["EU-CZ-1"], \
+                "avoided even while its set waits for a pod: such a pod runs nothing"
+            assert pool.avoided_datacenters("cpu") == [], "a GPU boot says nothing of the CPU pods there"
+            assert podd.read_avoided_datacenters() == recorded, "kept across a restart"
+        podd.AVOIDED_DATACENTERS_FILE.unlink()
 
         pool, _ = no_pod_pool(Path(tempfile.mkdtemp(prefix="podd-unrecorded-")), jobs=0)
         pod = podd.Pod("podd-g1", pool.secrets, a_job()["requires"], pool.config)   # booting, its id not yet recorded
@@ -718,6 +742,53 @@ def test_a_booting_pod_left_with_no_waiting_job_is_cancelled_and_one_past_the_bo
         assert pod.cancel_reason is None and "podd-g1" in pool.pods, "never cancelled before RunPod's id is saved"
     finally:
         podd.Pod, podd.STATUS_FILE = saved
+
+
+def test_a_create_that_failed_after_runpod_made_the_pod_avoids_its_datacenter_and_no_other_boot_failure_does():
+    """A boot failure is the host's when RunPod made the pod and pod.sh create then failed it (container never up, no
+    ssh, ERROR / TERMINATED): its datacenter is avoided. Not when podd's own steps after the create failed (an image
+    declaring no facts would ban a datacenter on every retry), nor when no pod of this boot is recorded (refused, or
+    deleted by hand: 2026-11-27 07:57-08:01, three EU-CZ-1 pods were pod.sh-deleted by a client while booting)."""
+    root = Path(tempfile.mkdtemp(prefix="podd-bootdc-"))
+    pool, queue_directory = no_pod_pool(root, jobs=1)
+    saved = podd.Pod, podd.STATUS_FILE
+    podd.Pod, podd.STATUS_FILE = PodThatDoesNotBoot, root / "PODS.json"
+    cases = [("the host's: avoided", False, "US-CA-2", True),
+             ("podd's own step after the create", True, "US-NE-1", False),
+             ("no pod of this boot recorded", False, None, False)]
+    try:
+        for case, created, datacenter, avoided in cases:
+            with contextlib.redirect_stdout(io.StringIO()) as said:
+                for wait in pool.waiting_for_a_pod.values():
+                    wait.retry_at_s = 0
+                pool.step()
+                pod = next(iter(pool.pods.values()))
+                pod.boot_started_s = time.time()
+                pod.session_file.unlink(missing_ok=True)   # pod.sh delete removed the last case's (no id here: kept)
+                if datacenter:
+                    record_a_session(pod, datacenter)
+                pod.created, pod.state, pod.problem = created, "boot failed", f"PodError: {case}"
+                pool.step()
+                assert not pool.pods and f"{pod.name} did not boot" in said.getvalue(), (case, said.getvalue()[-600:])
+            recorded = podd.read_avoided_datacenters().get("gpu", {})
+            if avoided:
+                assert recorded[datacenter]["because"] == "did not boot" and case in recorded[datacenter]["why"], \
+                    (case, recorded)
+            else:
+                assert datacenter not in recorded, (case, recorded)
+                assert ("is not avoided for it" if created else "no datacenter to avoid") in said.getvalue(), \
+                    (case, said.getvalue()[-600:])
+        stale = PodThatDoesNotBoot("podd-g1", pool.secrets, a_job()["requires"], pool.config)
+        record_a_session(stale, "EU-RO-1")
+        stale.boot_started_s = time.time() + 60
+        assert stale.session_of_this_boot() is None and stale.recorded_datacenter() is None, \
+            "an older pod's session is never this boot's"
+    finally:
+        podd.Pod, podd.STATUS_FILE = saved
+        if podd.AVOIDED_DATACENTERS_FILE.exists():
+            podd.AVOIDED_DATACENTERS_FILE.unlink()
+    assert all(podjobs.stage_state(stage) == podjobs.JOB for stage in queue_directory.iterdir()), \
+        "boot failures leave the jobs queued"
 
 
 def test_a_job_no_pod_can_hold_still_fails_at_once_while_another_set_waits_after_a_boot_failure():
@@ -1071,7 +1142,8 @@ def pod_sh_create_against(rest_pod_answers, graphql_answers, ssh_answers, create
                         "esac\n")
     fake_curl.chmod(0o755)
     fake_ssh.chmod(0o755)
-    environment = {**os.environ, "HOME": str(root), "PATH": f"{root / 'bin'}:{os.environ['PATH']}"}
+    environment = {**os.environ, "HOME": str(root), "PATH": f"{root / 'bin'}:{os.environ['PATH']}",
+                   "POD_SH_POLL_SECONDS": "0.05"}           # the fake answers at once: RunPod's 5 s pace is no test's
     environment.pop("PODD_SECRETS", None)
     started_s = time.time()
     try:
@@ -1978,10 +2050,14 @@ def test_podd_imports_nothing_but_the_standard_library_and_itself():
         assert not foreign, (module.name, foreign)
 
 
-if __name__ == "__main__":
-    started = time.time()
-    for name, test in sorted(globals().items()):
-        if name.startswith("test_"):
-            test()
-            print(f"PASS {name}")
-    print(f"all passed in {time.time() - started:.1f} s")
+if __name__ == "__main__":       # tests/test_podd.py [words]: only the tests whose name holds every word (all: none)
+    started, words = time.time(), sys.argv[1:]
+    chosen = [(name, test) for name, test in sorted(globals().items())
+              if name.startswith("test_") and all(word in name for word in words)]
+    if not chosen:
+        sys.exit(f"(╯°□°)╯ no test's name holds {words}")
+    for name, test in chosen:
+        test_started = time.time()
+        test()
+        print(f"PASS {name} ({time.time() - test_started:.2f} s)")
+    print(f"{len(chosen)} passed in {time.time() - started:.1f} s")
