@@ -71,11 +71,16 @@ pod.sh, no ssh, no rsync.
 - `boot_seconds` (default 150, the measured 97-155 s): podd opens another pod only while the backlog would take
   longer than this to drain on the pods up or booting. and they could not run it all at once (packed by cpu / card memory / RAM). A pod still booting
   when no waiting job is left for it is stopped and deleted; one whose ssh is not up 3 x boot_seconds after its
-  create is a boot failure (deleted, a miss of its set).
+  create is a boot failure (deleted, a miss of its set), and its datacenter is avoided by creates of its kind (GPU
+  or CPU) for `DID_NOT_BOOT_DATACENTER_HOURS` (12), as is one whose `pod.sh create` failed after RunPod made the pod
+  (2026-11-27: a 3090 in EU-CZ-1 ran out the deadline and podd's next creates went back there). A failed boot so
+  costs at most 3 x boot_seconds (+ a few seconds to delete) at the pod's price: at boot_seconds 150 and a $0.60/h
+  cap, 456 s, $0.076, once per datacenter per kind in 12 h. Raise boot_seconds if your image takes longer than
+  ~6 min to pull (podd's journal says each pod's "ssh up N s after create; container started (image pulled) M s").
 - `max_wait_for_a_pod_minutes` (default 60): a set with no pod it can run on -- RunPod refusing a create for stock ("no
   instances currently available"), no card under the price cap, a pod on an old driver, a pod that did not boot (`pod.sh create` failed, or podd could not read the pod), is waited out, never a failure
   on its own: the jobs stay JOB and podd retries one pod after 60 s, doubling to 10 min, avoiding
-  no slow datacenter (an old driver's still: such a pod runs nothing). While a pod of the set runs, its jobs wait for it however long; a set with NO
+  no slow datacenter (an old driver's and a did-not-boot one's still: such a pod runs nothing). While a pod of the set runs, its jobs wait for it however long; a set with NO
   pod for this long FAILS its jobs with every miss. `podd status` shows each wait and when it would fail.
 
 ## A job

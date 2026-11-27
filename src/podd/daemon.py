@@ -54,8 +54,8 @@ per job is the lowest; create is offered every flavor that holds the same jobs a
 first, cheapest first. A booting CPU pod's capacity is that plan. Facts, packing, idling and stock are the GPU pods'.
 NO POD YET IS NOT A FAILURE. pod.sh create exits POD_SH_NO_STOCK_EXIT when RunPod has no instance of any card
 offered; podd says so loudly once per attempt, the set's jobs stay JOB, and its next create waits
-no_pod_backoff_seconds (60 s doubling to 10 min) and is ONE pod (a probe, not a burst), avoiding no slow datacenter,
-until a create succeeds. No card under the cap counts the same way, and so does a pod on an old driver, and so does a
+no_pod_backoff_seconds (60 s doubling to 10 min) and is ONE pod (a probe, not a burst), avoiding no slow datacenter
+(but still an old driver's and a did-not-boot one's), until a create succeeds. No card under the cap counts the same way, and so does a pod on an old driver, and so does a
 pod that did not boot (2026-10-29: pod.sh create exited 1, "no public ssh port after 15 min"; a pause of its own
 FAILED the set's jobs, and a job queued during it, with no create of its own): ONE wait, NoPodWait. A set waiting
 for a pod that has had NO pod (none ready or
@@ -78,7 +78,12 @@ the next create backs off, and a set with no pod for max_wait_for_a_pod_minutes 
 An image that refuses the old driver at container start (NVIDIA_REQUIRE_CUDA: "OCI runtime create failed") never
 stays up: pod.sh create sees RunPod restart it (GraphQL runtime.uptimeInSeconds below 0 or going back, twice) and
 exits 1 seconds after the image is pulled (its 15 min ssh limit is the backstop), a boot failure like any other (a
-miss). Ready: takes jobs.
+miss). DID NOT BOOT (2026-11-27: an RTX 3090 in EU-CZ-1 missed the boot deadline and podd's next creates went back
+there): a pod past the boot deadline (Pool.cancel_boots), or whose pod.sh create failed after RunPod made it
+(Pool.avoid_where_it_did_not_boot), has its datacenter avoided by creates of its kind for
+DID_NOT_BOOT_DATACENTER_HOURS, even while its set waits for a pod (such a pod runs nothing); a failed boot thus costs
+at most one boot deadline (BOOT_DEADLINE_FACTOR x boot_seconds, plus the seconds its delete takes) per datacenter per
+kind in that time. Ready: takes jobs.
 SLOW or BROKEN: takes no more, deleted once empty. Deleted
 after idle_minutes with no job, when a job on it failed for a reason of the pod's own (ssh, rsync: it is BROKEN), once
 SLOW and empty, or when podd stops (a booting create is stopped, its pod deleted). pod.sh's watchdog
@@ -173,7 +178,15 @@ REFERENCE_MAX_AGE_SECONDS = 3600     # a pace measured longer ago is no referenc
 SLOW_DATACENTER_HOURS = 12           # a datacenter a slow pod of a kind was in: podd's creates of that kind avoid it
 OLD_DRIVER_DATACENTER_HOURS = 12     # a datacenter a GPU pod below min_cuda_version was in: GPU creates avoid it (a
                                      # host's driver, not the datacenter's: a guess that its neighbours are alike)
-AVOIDED_BECAUSE = ("slow", "old driver")   # why a datacenter is avoided (AVOIDED_DATACENTERS_FILE's `because`)
+DID_NOT_BOOT_DATACENTER_HOURS = 12   # a datacenter a pod of a kind did not boot in (past the boot deadline, or its
+                                     # create failed after RunPod made it): that kind's creates avoid it, even while
+                                     # its set waits for a pod (such a pod runs nothing). The journal 2026-11-06..27:
+                                     # the slowest GPU boots were all RTX 3090s in EU-CZ-1 (630 s on 11-06; 169-289 s;
+                                     # 11-27 past the deadline, then picked again 50 min later), the CPU pods past the
+                                     # deadline all in US-CA-2 (11-11, and twice in a row on 11-13: the replacement
+                                     # opened in the cancel's own pass landed there again)
+AVOIDED_BECAUSE = ("slow", "old driver", "did not boot")   # why a datacenter is avoided (AVOIDED_DATACENTERS_FILE's
+                                                           # `because`)
 MAX_ATTEMPTS = 4                     # a resumable job's attempts (the first included); the last one FAILS, never loops
 MAX_SLOW_STOPS = 2                   # a job is moved off a slow pod at most this often (then it runs on where it is:
                                      # its expected_s may be optimistic, and every pod would look slow)
@@ -209,8 +222,9 @@ BRING_HOME_TIMEOUT_S = 60            # one pull of a running job's command.log /
 
 STATUS_FILE = Path.home() / ".local" / "state" / "podd" / "PODS.json"
 # {kind: {datacenter: {"until_unix", "until", "why", "pod", "because"}}}: the datacenters podd's creates avoid,
-# kept across restarts; because "slow" (a slow pod was there: mark_slow) or "old driver" (a host whose driver was
-# below min_cuda_version: Pool.reject_old_driver)
+# kept across restarts; because "slow" (a slow pod was there: mark_slow), "old driver" (a host whose driver was
+# below min_cuda_version: Pool.reject_old_driver) or "did not boot" (a pod there missed the boot deadline or failed
+# its create after RunPod made it: Pool.cancel_boots, Pool.avoid_where_it_did_not_boot)
 AVOIDED_DATACENTERS_FILE = STATUS_FILE.parent / "avoided-datacenters.json"
 POD_SCRIPT = PACKAGE_DIRECTORY / "pod.sh"
 SECRETS_SCRIPT = PACKAGE_DIRECTORY / "secrets.sh"
@@ -910,6 +924,28 @@ class Pod:
             raise PodError(f"(╯°□°)╯ pod.sh delete {self.name} ({recorded}) exited {deleted.returncode}: THE POD MAY "
                            f"STILL BE BILLING; {POD_SCRIPT} account / delete {self.name} by hand")
 
+    def session_of_this_boot(self):
+        """pod.sh create's session file (price, card, datacenter: written the moment RunPod made the pod, before its
+        ssh is up) when it is THIS boot's, else None: no pod was made yet, or its record is gone (pod.sh delete, by
+        podd or by hand, removes it). An unreadable one is said loudly."""
+        try:
+            session = json.loads(self.session_file.read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as error:
+            say(f"(╯°□°)╯ {self.name}: {self.session_file} cannot be read ({error})")
+            return None
+        if self.boot_started_s is not None and session.get("created_at_unix_s", 0) < int(self.boot_started_s) - 1:
+            return None                  # an older pod's, never this boot's (pod.sh delete removes it: never seen)
+        return session
+
+    def recorded_datacenter(self):
+        """Where RunPod put this pod: its facts' datacenter once read, else what pod.sh create recorded for this boot
+        (None: unknown)."""
+        if self.facts and self.facts.get("datacenter"):
+            return self.facts["datacenter"]
+        return (self.session_of_this_boot() or {}).get("datacenter")
+
     def card_name(self):
         """What RunPod rented: the card nvidia-smi named (its facts), else the card or CPU flavor pod.sh create
         recorded in the session file (RunPod's Pod gpu.id / cpu.id), else said unknown."""
@@ -1247,8 +1283,8 @@ class Pool:
 
     def avoided_datacenters(self, kind, waiting_for_a_pod=False):
         """The datacenters this kind's creates avoid now (the expired ones are said and dropped): a slow pod's (not
-        while the set is waiting for a pod: a slow pod is better than none) and an old driver's (always: such a pod runs
-        nothing). A CPU host's slowness says nothing of a GPU host's in the same datacenter, and the reverse."""
+        while the set is waiting for a pod: a slow pod is better than none), an old driver's and a did-not-boot one's
+        (always: such a pod runs nothing). A CPU host's slowness says nothing of a GPU host's in the same datacenter, and the reverse."""
         recorded = self.avoided_datacenter_records.get(kind, {})
         for datacenter, record in list(recorded.items()):
             if record["until_unix"] <= time.time():
@@ -1262,7 +1298,7 @@ class Pool:
     def avoid_datacenter(self, pod, because, why, hours):
         """Record the pod's datacenter as avoided by creates of its kind for `hours` (AVOIDED_DATACENTERS_FILE); said
         loudly, as is a pod pod.sh recorded no datacenter for."""
-        datacenter, kind = (pod.facts or {}).get("datacenter"), pod_kind(pod.requires)
+        datacenter, kind = pod.recorded_datacenter(), pod_kind(pod.requires)
         if not datacenter:
             say(f"(╯°□°)╯ {pod.name}: pod.sh recorded no datacenter for it, so podd cannot avoid where it was "
                 f"({because})")
@@ -1275,6 +1311,22 @@ class Pool:
         say(f"(╯°□°)╯ {datacenter} is recorded {because.upper()} for {kind} pods: podd's {kind} creates avoid it for "
             f"{hours} h{', unless RunPod has no stock elsewhere' if because == 'slow' else ''} "
             f"({AVOIDED_DATACENTERS_FILE})")
+
+    def avoid_where_it_did_not_boot(self, pod):
+        """A pod whose boot failed (Pod.boot: "boot failed"): its datacenter is avoided for DID_NOT_BOOT_DATACENTER_HOURS
+        when RunPod made the pod and pod.sh create then failed it (its container never stayed up, its ssh never came,
+        RunPod put it in ERROR / TERMINATED, the pod vanished): the host's failure. Not when podd's own steps after the
+        create failed (pod.created: shipping podd-run.sh, reading the facts -- an image declaring no facts would
+        otherwise ban a datacenter on every retry), nor when no pod of this boot is recorded (refused before RunPod made
+        one, or deleted by hand: pod.sh delete removes the record). Each case is said."""
+        if pod.created:
+            say(f"(・_・;) {pod.name}: its create succeeded and podd's own steps after it failed: its datacenter "
+                f"({pod.recorded_datacenter() or 'unknown'}) is not avoided for it")
+        elif pod.session_of_this_boot() is None:
+            say(f"(・_・;) {pod.name}: no pod of this boot is recorded (RunPod made none, or its record was deleted, "
+                f"e.g. by a hand pod.sh delete): no datacenter to avoid")
+        else:
+            self.avoid_datacenter(pod, "did not boot", pod.problem, DID_NOT_BOOT_DATACENTER_HOURS)
 
     def reject_old_driver(self, pod):
         """A GPU pod whose driver is below min_cuda_version (Pod.boot: old_driver): deleted at once, its datacenter
@@ -1502,9 +1554,11 @@ class Pool:
         (2026-11-06: two pods still booting when the five jobs they were opened for had started elsewhere came up to
         nothing, 5.9 and 13.7 min billed, $0.14 of $0.333) -- or when its ssh is not up BOOT_DEADLINE_FACTOR x
         boot_seconds after its create began (that day's 3090 in EU-CZ-1 took 630 s against 109-176 s for the
-        others): a boot failure, a miss of its set (NoPodWait), so a needed pod is created again after the backoff. A
-        pod whose create has not recorded its id yet is left to the next pass, so a pod RunPod made is never lost
-        unrecorded."""
+        others): a boot failure, a miss of its set (NoPodWait), so a needed pod is created again after the backoff, and
+        its datacenter is avoided by its kind's creates for DID_NOT_BOOT_DATACENTER_HOURS, recorded HERE, before this
+        pass's open_pods (2026-11-13: the replacement opened in the cancel's own pass landed in the same US-CA-2 and
+        missed the deadline too). A pod whose create has not recorded its id yet is left to the next pass, so a pod
+        RunPod made is never lost unrecorded."""
         deadline_s = BOOT_DEADLINE_FACTOR * self.config["boot_seconds"]
         for pod in list(self.pods.values()):
             if pod.state != "booting" or pod.cancel_reason is not None or pod.recorded_pod_id() is None:
@@ -1516,6 +1570,7 @@ class Pool:
             elif booted_s > deadline_s:
                 pod.cancel(f"{BOOT_DEADLINE_SAID} ({deadline_s:.0f} s: {BOOT_DEADLINE_FACTOR} x boot_seconds "
                            f"{self.config['boot_seconds']}), {booted_s:.0f} s into its boot")
+                self.avoid_datacenter(pod, "did not boot", pod.cancel_reason, DID_NOT_BOOT_DATACENTER_HOURS)
 
     def open_pods(self, unplaced, ready, waiting_keys):
         """THE OPENING RULE per requirement set with jobs waiting, oldest set first (pods_to_open)."""
@@ -1615,6 +1670,7 @@ class Pool:
             elif pod.state == "boot failed":
                 self.pods.pop(pod.name)
                 say(f"(╯°□°)╯ {pod.name} did not boot: {pod.problem}; deleting it, its set's jobs stay queued")
+                self.avoid_where_it_did_not_boot(pod)    # before forget: its delete removes pod.sh's record
                 self.forget(pod, "it failed its create or its read")
                 self.no_pod_miss(key, pod.attempt, f"{pod.name} did not boot: {pod.problem}")
             elif pod.state == "old driver":
